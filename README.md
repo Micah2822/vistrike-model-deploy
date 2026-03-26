@@ -1,273 +1,224 @@
-# VISTRIKE RunPod Deployment Guide
+# VISTRIKE Serverless Inference (RunPod + Vercel)
 
-This folder contains everything needed to deploy the VISTRIKE inference backend on RunPod (or any GPU cloud). The React frontend (on Vercel) loads this backend inside an iframe via `VITE_BACKEND_URL`.
+**No always-on VM.** RunPod Serverless scales to zero — you pay only while inference runs.
+
+RunPod console config, GPU sizing, env vars, endpoint settings: **[RUNPOD.md](./RUNPOD.md)**
+
+---
 
 ## Architecture
 
 ```
-┌──────────────────────────────┐       iframe src        ┌──────────────────────────────────┐
-│  VERCEL (marketing repo)     │  ───────────────────▶   │  RUNPOD (GPU cloud)              │
-│                              │                         │                                  │
-│  React app:                  │                         │  testing-ui/                     │
-│   - Home, About, Privacy     │   VITE_BACKEND_URL      │    app.py  (Flask, port 5001)    │
-│   - Upload.jsx  ─────────────│──  points here ──────▶  │    static/ (index.html, app.js,  │
-│   - Upload.css               │                         │            style.css)             │
-│                              │                         │                                  │
-│  NO models, NO scripts,      │                         │  scripts/                        │
-│  NO testing-ui, NO Python    │                         │    10_inference.py, utils/ …     │
-│                              │                         │  configs/                        │
-│                              │                         │                                  │
-│                              │                         │  models/                         │
-│                              │                         │    unified/best.pt (etc.)        │
-│                              │                         │                                  │
-│                              │                         │  results/ (auto-created)         │
-│                              │                         │  uploads/ (auto-created)         │
-└──────────────────────────────┘                         └──────────────────────────────────┘
+┌─────────────────────────────┐         ┌──────────────────────┐         ┌──────────────────────┐
+│  VERCEL                     │         │  OBJECT STORAGE      │         │  RUNPOD SERVERLESS   │
+│                             │         │  (R2 / S3)           │         │                      │
+│  React app + analysis UI    │         │                      │         │  handler.py          │
+│  Vercel API routes:         │         │  uploads/video.mp4   │         │  scripts/            │
+│    /api/upload-url ─────────│────▶    │  results/job-id/     │    ◀────│  models/             │
+│    /api/analyze ────────────│─────────│──────────────────────│────▶    │  configs/            │
+│    /api/progress/:id ───────│─────────│──────────────────────│────▶    │                      │
+│    /api/results ────────────│────▶    │                      │         │                      │
+└─────────────────────────────┘         └──────────────────────┘         └──────────────────────┘
 ```
 
-## How it works
+**Flow:**
+1. User picks a video in the browser (Vercel)
+2. Vercel API route generates a **presigned upload URL** → browser uploads video to R2/S3
+3. Vercel API route calls **RunPod `/run`** with `video_url` + params + `s3Config`
+4. RunPod worker (`handler.py`) downloads video, runs inference, uploads results to R2/S3, returns summary
+5. Browser polls **Vercel `/api/progress/:jobId`** → Vercel polls **RunPod `/status/:jobId`**
+6. When done, browser fetches results from R2/S3
 
-1. User visits `/upload` on the Vercel site
-2. `Upload.jsx` calls `GET {VITE_BACKEND_URL}/api/status` to check if backend is alive
-3. If alive, it renders `<iframe src={VITE_BACKEND_URL}>` which loads the full analysis UI from Flask
-4. The analysis UI (`static/index.html` + `static/app.js`) handles video upload, progress polling, and results display — all served by the Flask backend
-5. When a user uploads a video, `app.py` runs `scripts/10_inference.py` via `subprocess.Popen` using the **Device** they picked in the UI (`cpu`, `cuda`, or `auto`)
-6. Results (annotated video, `summary.json`, `analysis.json`) are written to `results/` and served via `/api/results/`
+**No iframe. No Flask. No always-on server.**
 
-## Directory layout on RunPod
+---
 
-```
-/workspace/vistrike/
-├── testing-ui/
-│   ├── app.py              # Flask server (serves UI + API)
-│   └── static/
-│       ├── index.html      # Analysis UI shell
-│       ├── app.js          # Analysis UI logic (upload, polling, playback, dashboard)
-│       └── style.css       # Analysis UI styles
-├── scripts/
-│   ├── 10_inference.py     # CLI wrapper (imports utils)
-│   ├── inference_onnx.py   # ONNX entry (imports utils)
-│   └── utils/              # REQUIRED — pipeline implementation (batch_video_analyzer, ORT backend, …)
-│       ├── __init__.py
-│       ├── batch_video_analyzer.py
-│       ├── ort_video_backend.py
-│       ├── onnx_model_metadata.py
-│       └── onnx_export_wrappers.py
-├── configs/
-│   └── action_types.yaml   # Action types, colors, event keys (repo root relative to scripts/)
-├── models/
-│   └── unified/
-│       └── best.pt         # Trained model weights
-├── results/                # Auto-created; inference outputs go here
-└── uploads/                # Auto-created inside testing-ui/; cleaned after processing
-```
+## What's in this folder
 
-## Files to copy from the main repo
+| File | What it does |
+|------|-------------|
+| **`handler.py`** | RunPod serverless worker — downloads video, runs `BoxingAnalyzer`, uploads results to storage, returns summary + URLs |
+| **`Dockerfile`** | Builds the Docker image for the worker (PyTorch + CUDA + scripts) |
+| **`requirements.txt`** | Python deps for the worker image |
+| **`RUNPOD.md`** | RunPod console setup — endpoint creation, GPU sizing, env vars, model loading, API reference |
 
-| Destination on RunPod | Source in VISTRIKE-AI-Official |
-|---|---|
-| `testing-ui/app.py` | `Vistrike-Main-UI/testing-ui/app.py` |
-| `testing-ui/static/index.html` | `Vistrike-Main-UI/testing-ui/static/index.html` |
-| `testing-ui/static/app.js` | `Vistrike-Main-UI/testing-ui/static/app.js` |
-| `testing-ui/static/style.css` | `Vistrike-Main-UI/testing-ui/static/style.css` |
+---
+
+## What goes where
+
+### RunPod (this folder → Docker image)
+
+| In the image | Source |
+|--------------|--------|
+| `handler.py` | This folder |
 | `scripts/10_inference.py` | `scripts/10_inference.py` |
 | `scripts/inference_onnx.py` | `scripts/inference_onnx.py` |
-| `scripts/utils/` (entire package) | `scripts/utils/*.py` — **required**; `10_inference.py` does `from utils.batch_video_analyzer import …` with `cwd=PROJECT_ROOT`, so Python resolves `utils` as `scripts/utils` |
-| `configs/action_types.yaml` | `configs/action_types.yaml` — used by `batch_video_analyzer` (has in-code fallback if missing, but you want the real file in production) |
-| `models/unified/best.pt` | Your trained weights — too large for GitHub; get them onto the pod using the next section |
+| `scripts/utils/` (full folder) | `scripts/utils/` |
+| `configs/action_types.yaml` | `configs/action_types.yaml` |
+| `models/unified/best.pt` | Your weights — bake in, download at startup, or use network volume ([RUNPOD.md](./RUNPOD.md)) |
 
-*(Optional: `data/attributes/` only for some old checkpoints — skip unless you know you need it.)*
+### Vercel (the other repo)
 
-## Getting models from your machine onto RunPod
+| What | Purpose |
+|------|---------|
+| React app (Home, About, etc.) | Main site |
+| `Upload.jsx` + `Upload.css` | Upload page — **rewritten: no iframe**, calls Vercel API routes |
+| `testing-ui/static/*` (`index.html`, `app.js`, `style.css`) | Analysis UI — served from Vercel as static files, `API_BASE` points to Vercel API routes |
+| **Vercel API routes** (new) | `/api/upload-url`, `/api/analyze`, `/api/progress/:id`, `/api/results` — proxy to RunPod + R2 |
 
-1. **SCP over SSH** — RunPod shows **SSH** details on the pod page (host, port, key). SSH in once and run `mkdir -p /workspace/vistrike/models/unified` if needed. From your laptop:
+### Object storage (R2 / S3)
 
-   ```bash
-   scp -i /path/to/key -P PORT ./best.pt root@POD_HOST:/workspace/vistrike/models/unified/best.pt
-   ```
+One bucket with two prefixes:
+- `uploads/` — user videos (presigned PUT from browser)
+- `results/{job_id}/` — `summary.json`, `analysis.json`, `annotated.mp4` (written by handler)
 
-   Replace host, port, key path, and destination with your layout. Use `scp -r ./models root@POD_HOST:/workspace/vistrike/` to copy a whole `models` folder.
+---
 
-2. **Upload to cloud, then download on the pod** — Put `best.pt` in S3, R2, etc. (or use a presigned URL). On the pod:
-
-   ```bash
-   mkdir -p /workspace/vistrike/models/unified
-   curl -L -o /workspace/vistrike/models/unified/best.pt "https://YOUR_DOWNLOAD_URL"
-   ```
-
-3. **RunPod Network Volume** — Attach a volume to the pod, copy weights onto it once (via SCP from your machine to the pod path that mounts the volume), so new pods can reuse the same volume without re-uploading.
-
-## Required changes to `app.py`
-
-### 1. Fix `PROJECT_ROOT`
-
-The original line assumes the monorepo layout (`VISTRIKE-AI-Official/Vistrike-Main-UI/testing-ui/app.py` → 3 parents up). On RunPod, if the layout is `/workspace/vistrike/testing-ui/app.py`, change it to 1 parent up:
-
-```python
-# BEFORE (monorepo layout)
-PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
-
-# AFTER (RunPod layout: /workspace/vistrike/testing-ui/app.py)
-PROJECT_ROOT = Path(__file__).parent.parent.resolve()
-```
-
-This makes `PROJECT_ROOT` = `/workspace/vistrike/`, so it correctly finds `scripts/`, `models/`, and `results/`.
-
-### 2. Lock down CORS for production
-
-```python
-# BEFORE
-CORS(app)
-
-# AFTER — only allow your Vercel frontend
-CORS(app, origins=["https://your-site.vercel.app"])
-```
-
-### 3. Disable debug mode
-
-```python
-# BEFORE
-app.run(host='0.0.0.0', port=port, debug=True)
-
-# AFTER
-app.run(host='0.0.0.0', port=port, debug=False)
-```
-
-## API endpoints (what the frontend expects)
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/` | Serves the analysis UI (`static/index.html`) — loaded inside the iframe |
-| `GET` | `/api/status` | Health check. Returns `{ status, inference_script, has_unified_model, ... }` |
-| `POST` | `/api/analyze` | Upload video + start inference. Multipart form: `video`, `confidence`, `attr_confidence`, `device`, `save_video`, `backend` |
-| `GET` | `/api/progress/<output_dir>` | Poll inference progress (JSON: `status`, `current_frame`, `total_frames`, etc.) |
-| `GET` | `/api/results/<path:filename>` | Serve result files (`summary.json`, `analysis.json`, annotated video) |
-
-## Python dependencies
-
-On the pod:
+## Build and deploy the worker
 
 ```bash
-pip install flask flask-cors werkzeug opencv-python-headless
+cd vistrike-runpod-deploy
+docker build -t yourdockerhub/vistrike-worker:latest .
+docker push yourdockerhub/vistrike-worker:latest
 ```
 
-Also install everything `scripts/10_inference.py` needs from the main repo’s `requirements.txt`.
+Then create a serverless endpoint in RunPod console pointing at this image. Full steps in **[RUNPOD.md](./RUNPOD.md)**.
 
-**GPU pods:** install a **CUDA-enabled** PyTorch build (CPU-only wheels will never use the GPU). Use the command from [pytorch.org](https://pytorch.org) that matches your CUDA version (check with `nvidia-smi` on the pod). Example shape:
+---
 
-```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-```
+## Vercel env vars (set in dashboard)
 
-(Pick the `cu1xx` URL that matches what `nvidia-smi` reports.)
+| Variable | Value |
+|----------|-------|
+| `RUNPOD_ENDPOINT_ID` | Your RunPod serverless endpoint ID |
+| `RUNPOD_API_KEY` | Your RunPod API key |
+| `R2_ENDPOINT_URL` | e.g. `https://xxxx.r2.cloudflarestorage.com` |
+| `R2_ACCESS_KEY_ID` | R2 access key |
+| `R2_SECRET_ACCESS_KEY` | R2 secret |
+| `R2_BUCKET_NAME` | e.g. `vistrike-data` |
 
-## RunPod pod setup (GPU, ports, checks)
-
-**1. Pick a GPU template** — Create the pod from a template that includes an **NVIDIA** GPU and a recent CUDA driver. CPU-only pods cannot run CUDA inference.
-
-**2. Confirm the GPU is visible**
-
-```bash
-nvidia-smi
-```
-
-You should see your GPU and driver version. If this fails, fix the template / image before debugging Python.
-
-**3. Confirm PyTorch sees CUDA**
-
-```bash
-python3 -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
-```
-
-Expect `True` and a CUDA version string. If `False`, reinstall `torch` with a CUDA wheel (see above).
-
-**4. Web UI device = CUDA** — In `static/index.html`, the **Device** dropdown defaults to **CPU**. Users must choose **CUDA (GPU)** before **Analyze** (or use **Auto** if that resolves to CUDA on your stack). For a pod-only deployment you can change the default `<option>` to `cuda` in your fork so you do not rely on users switching it.
-
-**5. Expose the Flask port** — In RunPod, map the container port your app listens on (e.g. `5001`, or whatever you set `PORT` to) to the public **HTTP** port / proxy URL you put in `VITE_BACKEND_URL`.
-
-**6. Disk** — Leave enough volume space for `models/`, uploaded videos, and `results/` (annotated videos are large).
-
-**7. Timeouts** — Inference can run many minutes; use RunPod / proxy settings that do not cut off long requests or idle streaming for huge uploads.
-
-## Running
-
-```bash
-cd /workspace/vistrike/testing-ui
-python3 app.py
-```
-
-Flask starts on port 5001 by default. Override with the `PORT` env var:
-
-```bash
-PORT=8080 python3 app.py
-```
-
-## Vercel side setup
-
-On the Vercel repo, the **only** thing needed:
-
-1. `Upload.jsx` + `Upload.css` exist in `src/pages/`
-2. Route wired in `App.jsx`: `<Route path="/upload" element={<Upload />} />`
-3. Nav link in `Header.jsx`: `<Link to="/upload">`
-4. **Environment variable** in Vercel dashboard:
-
-```
-VITE_BACKEND_URL = https://your-runpod-public-url.com
-```
-
-Redeploy after setting this. No other code changes needed — `Upload.jsx` already reads `VITE_BACKEND_URL`.
+---
 
 ## Prompt to give Claude on the Vercel repo
 
-After copying `Upload.jsx` and `Upload.css` into the other repo, paste this to Claude:
-
 ```
-I've already copied these files into this repo:
-- src/pages/Upload.jsx (iframe wrapper that loads VITE_BACKEND_URL)
-- src/pages/Upload.css
+We're switching from an iframe + Flask backend to RunPod Serverless.
+All static files from testing-ui/ are already copied into this repo.
+Upload.jsx and Upload.css are already in src/pages/.
 
-I need you to wire them up:
+Here's the new architecture:
+- NO iframe. NO Flask server. NO VITE_BACKEND_URL.
+- The analysis UI (testing-ui/static/index.html, app.js, style.css) 
+  is served from THIS repo as static assets under public/analysis/ 
+  (or similar).
+- Vercel API routes proxy between the browser and RunPod Serverless + R2.
+- Object storage (Cloudflare R2) holds uploaded videos and inference results.
 
-1. In src/App.jsx: import Upload from './pages/Upload' and add
-   <Route path="/upload" element={<Upload />} />
+I need you to implement:
 
-2. In the Header/nav component: add a Link to="/upload" labeled
-   "Upload" (use class "nav-link nav-link-primary" if we have that
-   pattern, otherwise match existing nav link style).
+1. VERCEL API ROUTES (src/api/ or app/api/ depending on framework):
 
-3. If Home.jsx has any CTA buttons, add a "Upload Footage" button
-   that links to /upload matching the existing button style.
+   a) POST /api/upload-url
+      - Generates a presigned PUT URL for R2 so the browser can upload 
+        the video directly to storage.
+      - Input: { filename, contentType }
+      - Output: { uploadUrl, videoKey }
+      - Uses env vars: R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, 
+        R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME
 
-4. Upload.jsx reads VITE_BACKEND_URL (already in the file). I will
-   set this env var in Vercel to point at our RunPod backend. No
-   code change needed for that.
+   b) POST /api/analyze
+      - Calls RunPod serverless: POST https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/run
+      - Auth: Authorization: Bearer {RUNPOD_API_KEY}
+      - Body: {
+          "input": {
+            "video_url": "<R2 public/presigned URL for the uploaded video>",
+            "confidence": <from request>,
+            "attr_confidence": <from request>,
+            "save_video": <from request>
+          },
+          "s3Config": {
+            "accessId": R2_ACCESS_KEY_ID,
+            "accessSecret": R2_SECRET_ACCESS_KEY,
+            "bucketName": R2_BUCKET_NAME,
+            "endpointUrl": R2_ENDPOINT_URL
+          }
+        }
+      - Output: { jobId } (from RunPod response.id)
+      - Uses env vars: RUNPOD_ENDPOINT_ID, RUNPOD_API_KEY, R2_*
 
-5. The Upload page shows a "Backend Not Running" warning when it
-   can't reach the backend -- update the warning message text to say
-   something like "The analysis server is currently offline. Please
-   try again later." instead of the current dev instructions about
-   running a local Flask server. Remove the <ol> with terminal
-   instructions since end users won't be running anything locally.
+   c) GET /api/progress/:jobId
+      - Calls RunPod: GET https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/status/{jobId}
+      - Auth: Authorization: Bearer {RUNPOD_API_KEY}
+      - Returns the RunPod status response to the browser.
+        status will be IN_QUEUE, IN_PROGRESS, COMPLETED, or FAILED.
+        When IN_PROGRESS, output may contain progress_update data
+        (percent, status message).
+        When COMPLETED, output contains summary + result URLs.
 
-That's all. The Upload page is just an iframe -- all analysis UI,
-video upload, progress tracking, and results display are served by
-the remote backend inside that iframe. No testing-ui/, no scripts/,
-no models/ in this repo.
+   d) GET /api/results/:key
+      - Fetches a file from R2 and streams it to the browser.
+      - Used for analysis.json, summary.json, annotated video.
+      - Or: generate a presigned GET URL and redirect.
+
+2. UPDATE testing-ui/static/app.js (now at public/analysis/app.js 
+   or wherever you placed it):
+   - Change API_BASE from '' to '' (or wherever Vercel API routes live 
+     — should be same origin so '' works).
+   - Replace the analyzeVideo() function flow:
+     OLD: FormData upload to /api/analyze, poll /api/progress, 
+          fetch /api/results.
+     NEW:
+       a) Call /api/upload-url to get presigned URL
+       b) PUT the video file directly to that URL (show upload progress)
+       c) Call /api/analyze with the video key + params → get jobId
+       d) Poll /api/progress/:jobId until COMPLETED
+       e) Read results from the COMPLETED response output (summary 
+          inline, result URLs for video/analysis.json)
+   - The progress response shape changes:
+     OLD: { status, current_frame, total_frames, ... }
+     NEW: RunPod status: { status: "IN_PROGRESS", 
+          output: { status: "analyzing", percent: 50 } }
+     Map appropriately in the polling UI.
+   - Results: summary comes inline in COMPLETED output. Annotated 
+     video URL comes from output.video_url. analysis.json from 
+     output.analysis_url.
+   - Remove checkServerStatus() or adapt it to call /api/analyze 
+     health endpoint or just show "ready".
+
+3. UPDATE Upload.jsx:
+   - Remove the iframe entirely.
+   - Instead, either:
+     a) Embed the analysis page directly (import the HTML/JS), or
+     b) Route to a page that loads the static analysis UI 
+        (simplest: put index.html content in a React component, 
+        or load public/analysis/index.html in the page).
+   - Remove VITE_BACKEND_URL references.
+   - Remove the "backend not running" warning (there's no backend 
+     to check — RunPod scales on demand).
+
+4. ENV VARS needed in Vercel dashboard:
+   RUNPOD_ENDPOINT_ID, RUNPOD_API_KEY,
+   R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME
+
+The RunPod serverless handler (handler.py) is already deployed 
+separately — you don't need to touch it. It expects:
+- input.video_url (URL to download the video from)
+- input.confidence, input.attr_confidence, input.save_video
+- s3Config for uploading results
+- Returns: { status, summary, summary_url, analysis_url, video_url }
+- Progress updates during processing (percent + status string)
 ```
 
-## Production checklist
+---
 
-- [ ] RunPod **GPU** template (not CPU-only); `nvidia-smi` works on the pod
-- [ ] PyTorch **CUDA** build installed; `torch.cuda.is_available()` is `True`
-- [ ] Analysis UI uses **CUDA (GPU)** or **Auto** (not left on default **CPU** unless intentional)
-- [ ] Enough disk for models + `results/`
-- [ ] `PROJECT_ROOT` in `app.py` points to the correct root (where `scripts/` and `models/` live)
-- [ ] CORS origin set to your Vercel domain
-- [ ] `debug=False` in Flask
-- [ ] RunPod port is exposed with HTTPS
-- [ ] Upload size limit passes through any proxy (500MB)
-- [ ] Request timeout is long enough for inference (can take several minutes)
-- [ ] `GET /api/status` returns 200 so Upload page shows "connected"
-- [ ] `VITE_BACKEND_URL` set in Vercel dashboard and site redeployed
-- [ ] Model weights present at `models/unified/best.pt`
-- [ ] Inference scripts present at `scripts/10_inference.py` and `scripts/inference_onnx.py`
+## Checklist
+
+- [ ] Docker image built and pushed
+- [ ] RunPod serverless endpoint created with correct GPU, env vars, image
+- [ ] R2/S3 bucket created with access keys
+- [ ] Models in the image (baked, downloaded, or on volume)
+- [ ] Vercel API routes implemented (upload-url, analyze, progress, results)
+- [ ] `app.js` updated for new flow (presigned upload → RunPod job → poll → results)
+- [ ] `Upload.jsx` updated (no iframe)
+- [ ] Vercel env vars set: `RUNPOD_ENDPOINT_ID`, `RUNPOD_API_KEY`, `R2_*`
+- [ ] Test end-to-end: upload video → inference → view results

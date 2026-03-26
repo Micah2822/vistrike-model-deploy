@@ -1,98 +1,186 @@
-# RunPod configuration guide (VISTRIKE backend)
+# RunPod Serverless setup (VISTRIKE inference)
 
-Companion to **[README.md](./README.md)** (files, `app.py`, Vercel). RunPod docs: [Pods overview](https://docs.runpod.io/pods/overview), [Templates](https://docs.runpod.io/pods/templates/overview), [Expose ports](https://docs.runpod.io/pods/configuration/expose-ports).
-
----
-
-## 1. Pod vs Serverless — what to pick
-
-| | **GPU Pod** | **Serverless (endpoint / worker)** |
-|---|-------------|-------------------------------------|
-| **What it is** | A long-running VM with a GPU; you SSH in, install deps, run `python app.py`. | Managed workers that run **handler code** per request/job; scales up/down; you ship a Docker image + handler API. |
-| **Fits VISTRIKE today?** | **Yes.** Flask stays up, writes to `results/`, runs `subprocess` inference, serves static UI + REST. | **Not without a rewrite.** You’d replace the Flask process model with a worker that accepts jobs (e.g. upload to object storage → process → return), no always-on disk session as-is. |
-| **Pros** | Full control, Jupyter/SSH, same as local dev, long jobs OK after upload. | Pay per active inference second, autoscale, no babysitting a VM. |
-| **Cons** | You pay while the pod runs (even idle). You manage updates, security, CORS. | Cold starts, different architecture, not drop-in for current `testing-ui/app.py`. |
-| **Recommendation** | **Use a Pod** for this repo’s backend until you intentionally redesign for serverless. | Use later if you build a dedicated inference worker + queue/storage. |
-
-**CPU-only Pod:** Cheapest for smoke tests. Install CPU `torch`, use **Device → CPU** in the UI. Too slow for real users.
+Serverless = **pay only while inference runs**, scale to zero when idle, no VM babysitting.
 
 ---
 
-## 2. Template vs custom image vs “GitHub”
+## Architecture
 
-| Source | What you do | Pros | Cons |
-|--------|-------------|------|------|
-| **Community / official template** (e.g. PyTorch + CUDA) | Pick template in console → deploy Pod. | Fastest path; drivers + CUDA usually correct. | Less reproducible unless you snapshot; you still `pip install` Flask + your deps after start. |
-| **My template** (saved in console) | Save a configured Pod as your own template. | One-click same disk size, ports, image, env next time. | You maintain it when RunPod or CUDA updates. |
-| **Custom container** (Docker Hub / GHCR / ECR) | Point Pod at **your** image that already has Python, CUDA, Flask, etc. | Reproducible, CI can build it. | You build and push images; larger upfront work. |
-| **Hub / repo “deploy as Pod”** | Some RunPod Hub flows deploy a repo as a Pod ([docs](https://docs.runpod.io/hub/overview#deploy-as-a-pod)). | Good if the repo is meant to run as a Pod. | Must match their layout; verify it’s not serverless-only. |
+```
+Browser (Vercel)                   Vercel API routes               RunPod Serverless
+───────────────                    ─────────────────               ─────────────────
+1. User picks video                                                
+2. Gets presigned URL  ──────────▶ /api/upload-url                 
+3. Uploads video to R2/S3                                          
+4. Calls "start job"   ──────────▶ /api/analyze ──────────────────▶ POST /run
+                                   (passes video_url + params)      → handler.py downloads video
+                                                                    → runs BoxingAnalyzer
+                                                                    → uploads results to R2/S3
+                                                                    → returns summary + URLs
+5. Polls progress       ──────────▶ /api/progress/:jobId ─────────▶ GET /status/:jobId
+6. Gets results          ──────────▶ /api/results (reads from R2)  
+```
 
-**Practical default for VISTRIKE:** start from a **PyTorch + NVIDIA CUDA** community template, then follow **README.md** to lay out `PROJECT_ROOT`, `pip install`, and run Flask. Move to a **custom Dockerfile** when you want repeatable deploys without manual steps.
-
----
-
-## 3. GPU memory (VRAM) — rough guide
-
-Exact need depends on your checkpoint size, resolution, and batch settings. Use this as a budget guide:
-
-| VRAM (per GPU) | Cost | Pros | Cons |
-|----------------|------|------|------|
-| **~8 GB** (e.g. RTX 3060 class) | Lower | Cheap experiments. | Higher **OOM** risk on long 1080p+ clips or heavy unified + action stack; may need smaller input or CPU offload tricks. |
-| **12–16 GB** | Mid | **Good default** for many single-video boxing runs if models are not huge. | Still watch resolution and concurrent jobs (you should run **one** analysis at a time per pod unless you scale). |
-| **24 GB+** | Higher | Headroom for larger models, higher res, fewer surprises. | $$$; often overkill if 12–16 GB works in testing. |
-
-**How to decide:** run a **max-length / max-resolution** clip locally on a machine with known VRAM; match or exceed that on RunPod. If you see CUDA OOM in logs, step up VRAM or reduce load (resolution, batch, or model).
+**No iframe.** The analysis UI (`index.html`, `app.js`, `style.css`) is served from **Vercel** and calls Vercel API routes. The old `testing-ui/app.py` Flask server is **replaced** by `handler.py`.
 
 ---
 
-## 4. Container / Pod fields (what to set in the console)
+## What you need
 
-| Setting | What to choose |
-|---------|----------------|
-| **GPU type** | NVIDIA with enough VRAM (see §3). |
-| **Cloud** | **Secure Cloud** — more stable / enterprise-ish. **Community Cloud** — often cheaper; IPs/ports can change more on restart. |
-| **Container disk** | Enough for: OS + conda/pip + **PyTorch** + **all model weights** + **uploads** + **results** (annotated MP4s are large). **50 GB+** is a sane starting point if models are multi-GB; increase if you keep many jobs. |
-| **Network volume** (optional) | Attach if `models/` (or full `PROJECT_ROOT`) must **survive pod delete**. Mount path depends on template — confirm where `/workspace` (or equivalent) points. |
-| **Expose HTTP ports** | Internal port Flask uses (**`5001`** unless you change `PORT`). Public URL: `https://<POD_ID>-<PORT>.proxy.runpod.net` → **`VITE_BACKEND_URL`**. |
-| **Expose TCP ports** | e.g. **22** for SSH/SCP to copy weights. Use **Connect** in UI for mapped host:port. |
-| **Start command** (if asked) | Often empty if you start manually over SSH; or a script that `cd testing-ui && python3 app.py` after deps exist. |
-
-**Binding:** Flask must listen on **`0.0.0.0`**, not only `127.0.0.1` (already true in `app.py`).
-
-**HTTP proxy caveat:** Cloudflare ~**100 s** per long request. **`POST /api/analyze`** stays open until the **upload** finishes — huge/slow uploads can **524**. Progress/results **GET**s are short and usually fine.
+| Component | What | Where |
+|-----------|------|-------|
+| **RunPod Serverless endpoint** | Runs `handler.py` in a Docker container with GPU | RunPod |
+| **Object storage** (R2 / S3) | Holds uploaded videos + inference results | Cloudflare R2, AWS S3, etc. |
+| **Vercel API routes** | Proxy between browser and RunPod API; generates presigned upload URLs; hides API keys | Vercel (other repo) |
+| **Static analysis UI** | `index.html`, `app.js`, `style.css` — served from Vercel, calls `/api/*` routes | Vercel (other repo) |
 
 ---
 
-## 5. Environment variables
+## RunPod console: create serverless endpoint
 
-Set in the Pod / template **Environment** section where the console allows it.
+### Step 1 — Build and push Docker image
+
+```bash
+cd vistrike-runpod-deploy
+
+# If models are small enough to bake in, uncomment COPY models/ in Dockerfile.
+# Otherwise, download at handler startup or use RunPod network volume.
+
+docker build -t yourdockerhub/vistrike-worker:latest .
+docker push yourdockerhub/vistrike-worker:latest
+```
+
+Or use **GitHub integration** (RunPod can build from a repo automatically).
+
+### Step 2 — Create endpoint in RunPod console
+
+Go to **[Serverless → Endpoints → New Endpoint](https://www.console.runpod.io/serverless)**.
+
+| Setting | Value |
+|---------|-------|
+| **Endpoint name** | `vistrike-inference` (or whatever you want) |
+| **Worker image** | `yourdockerhub/vistrike-worker:latest` (or GitHub source) |
+| **GPU** | Pick based on your model size (see GPU sizing below) |
+| **Min workers** | `0` (scale to zero = no cost when idle) |
+| **Max workers** | `1` to start (increase for concurrency) |
+| **Idle timeout** | e.g. `60s` — worker stays warm this long after a job |
+| **Execution timeout** | e.g. `600000` ms (10 min) — max time per job |
+| **Container disk** | 20 GB+ (needs room for temp video + output) |
+| **Network volume** (optional) | Mount with your `models/` if you don't bake them in |
+
+### Step 3 — Environment variables
+
+Set in the endpoint **Environment** section:
 
 | Variable | Purpose |
 |----------|---------|
-| **`PORT`** | Port Flask listens on; must match **Expose HTTP ports** (default in code: `5001`). |
-| **`CUDA_VISIBLE_DEVICES`** | e.g. `0` to pin a single GPU if multiple are visible. |
-| **`PYTHONUNBUFFERED=1`** | Cleaner live logs (optional). |
-| **`RUNPOD_TCP_PORT_*`** | RunPod may inject mapped ports for advanced TCP setups ([symmetrical ports](https://docs.runpod.io/pods/configuration/expose-ports)); only if you use that pattern. |
-| **Secrets for bootstrap** | e.g. **`HF_TOKEN`** (Hugging Face), **`AWS_*`** — only if your **startup script** downloads models; not required if you SCP weights in. |
+| `DEVICE` | `cuda` (default) or `cpu` |
+| `DEFAULT_CONFIDENCE` | Detection threshold (default `0.5`) |
+| `DEFAULT_ATTR_CONFIDENCE` | Attribute threshold (default `0.0`) |
+| `DEFAULT_ACTION_CONFIDENCE` | Action event threshold (default `0.6`) |
 
-App-specific: **`VITE_BACKEND_URL`** is set on **Vercel**, not on RunPod.
+### Step 4 — Note your endpoint ID and API key
+
+- **Endpoint ID**: shown on the endpoint page (e.g. `abc123xyz`)
+- **API key**: RunPod account → Settings → API Keys
+
+You'll give both to the Vercel repo as env vars.
 
 ---
 
-## 6. After the pod starts
+## GPU sizing
 
-```bash
-nvidia-smi
-python3 -c "import torch; print(torch.cuda.is_available())"
+| VRAM | Cost | Fits |
+|------|------|------|
+| **~8 GB** | Cheapest | Tight; may OOM on high-res or large models |
+| **12–16 GB** | Mid | **Good default** for most boxing clips |
+| **24 GB+** | Higher | Headroom for bigger models or higher res |
+
+Test with your **longest / highest-res clip** to find the right tier.
+
+---
+
+## Getting models into the worker
+
+1. **Bake into Docker image** — Uncomment `COPY models/ /app/models/` in Dockerfile. Simple but image is huge; rebuild on weight changes.
+2. **Download at startup** — Add a download step in `handler.py` before `load_model()` (e.g. from S3/R2/HF). First cold start is slower.
+3. **RunPod network volume** — Attach a volume with `models/` pre-loaded; set mount path in endpoint config so `/app/models` resolves.
+
+---
+
+## How the handler works
+
+`handler.py` receives a job:
+
+```json
+{
+  "id": "job-abc",
+  "input": {
+    "video_url": "https://your-bucket/uploads/video.mp4",
+    "confidence": 0.5,
+    "save_video": true
+  },
+  "s3Config": {
+    "accessId": "...",
+    "accessSecret": "...",
+    "bucketName": "vistrike-results",
+    "endpointUrl": "https://your-r2-endpoint"
+  }
+}
 ```
 
-In the analysis UI: **Device → CUDA (GPU)** (the HTML default is **CPU**).
+1. Downloads video from `video_url`
+2. Runs `BoxingAnalyzer.analyze_video()` + `compute_summary()`
+3. If `s3Config` provided: uploads `summary.json`, `analysis.json`, annotated video to storage
+4. Returns summary inline + result URLs
+5. Sends progress updates via `runpod.serverless.progress_update()`
 
 ---
 
-## 7. Links
+## RunPod API (what Vercel calls)
 
-- [Expose ports / proxy URL / timeouts](https://docs.runpod.io/pods/configuration/expose-ports)  
-- [Pod templates](https://docs.runpod.io/pods/templates/overview)  
-- [Pod pricing](https://docs.runpod.io/pods/pricing)  
-- [Serverless](https://docs.runpod.io/serverless/overview) — read before choosing it over a Pod for production.
+Base: `https://api.runpod.ai/v2/{ENDPOINT_ID}`  
+Auth: `Authorization: Bearer {RUNPOD_API_KEY}`
+
+| Action | Method | Path | Body |
+|--------|--------|------|------|
+| Start job | POST | `/run` | `{"input": {...}, "s3Config": {...}}` |
+| Poll status | GET | `/status/{job_id}` | — |
+| Cancel | POST | `/cancel/{job_id}` | — |
+| Health | GET | `/health` | — |
+
+**`/run`** returns `{"id": "job-abc", "status": "IN_QUEUE"}`.  
+**`/status`** returns `{"status": "IN_PROGRESS", "output": {...}}` or `{"status": "COMPLETED", "output": {...}}`.
+
+---
+
+## Object storage (R2 / S3)
+
+You need a bucket for:
+- **Uploaded videos** (user uploads here via presigned URL from Vercel)
+- **Results** (handler uploads here after inference)
+
+Create a bucket, get access keys, and set them in:
+- RunPod handler (passed as `s3Config` in the job, or as env vars)
+- Vercel API routes (to generate presigned upload URLs)
+
+---
+
+## Testing locally
+
+```bash
+cd vistrike-runpod-deploy
+python handler.py --test_input '{"input": {"video_url": "file:///path/to/test.mp4", "confidence": 0.5, "save_video": false}}'
+```
+
+---
+
+## Files in this folder
+
+| File | Purpose |
+|------|---------|
+| `handler.py` | RunPod serverless handler — replaces `testing-ui/app.py` |
+| `Dockerfile` | Builds the worker image |
+| `requirements.txt` | Python deps for the worker |
+| `README.md` | Full deployment guide (files, architecture, Vercel prompt) |
+| `RUNPOD.md` | This file — RunPod serverless config |
