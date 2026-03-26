@@ -15,7 +15,7 @@ This folder contains everything needed to deploy the VISTRIKE inference backend 
 │                              │                         │                                  │
 │  NO models, NO scripts,      │                         │  scripts/                        │
 │  NO testing-ui, NO Python    │                         │    10_inference.py, utils/ …     │
-│                              │                         │  configs/, data/attributes/      │
+│                              │                         │  configs/                        │
 │                              │                         │                                  │
 │                              │                         │  models/                         │
 │                              │                         │    unified/best.pt (etc.)        │
@@ -31,7 +31,7 @@ This folder contains everything needed to deploy the VISTRIKE inference backend 
 2. `Upload.jsx` calls `GET {VITE_BACKEND_URL}/api/status` to check if backend is alive
 3. If alive, it renders `<iframe src={VITE_BACKEND_URL}>` which loads the full analysis UI from Flask
 4. The analysis UI (`static/index.html` + `static/app.js`) handles video upload, progress polling, and results display — all served by the Flask backend
-5. When a user uploads a video, `app.py` runs `scripts/10_inference.py` via `subprocess.Popen` on the GPU
+5. When a user uploads a video, `app.py` runs `scripts/10_inference.py` via `subprocess.Popen` using the **Device** they picked in the UI (`cpu`, `cuda`, or `auto`)
 6. Results (annotated video, `summary.json`, `analysis.json`) are written to `results/` and served via `/api/results/`
 
 ## Directory layout on RunPod
@@ -55,8 +55,6 @@ This folder contains everything needed to deploy the VISTRIKE inference backend 
 │       └── onnx_export_wrappers.py
 ├── configs/
 │   └── action_types.yaml   # Action types, colors, event keys (repo root relative to scripts/)
-├── data/
-│   └── attributes/         # label_map.json per attribute (cwd = PROJECT_ROOT when Flask runs inference)
 ├── models/
 │   └── unified/
 │       └── best.pt         # Trained model weights
@@ -76,8 +74,9 @@ This folder contains everything needed to deploy the VISTRIKE inference backend 
 | `scripts/inference_onnx.py` | `scripts/inference_onnx.py` |
 | `scripts/utils/` (entire package) | `scripts/utils/*.py` — **required**; `10_inference.py` does `from utils.batch_video_analyzer import …` with `cwd=PROJECT_ROOT`, so Python resolves `utils` as `scripts/utils` |
 | `configs/action_types.yaml` | `configs/action_types.yaml` — used by `batch_video_analyzer` (has in-code fallback if missing, but you want the real file in production) |
-| `data/attributes/` | **Usually omit.** Not present in many clones. Only needed for **legacy** unified checkpoints where `attribute_config` in the `.pt` is a **list**; the code then rebuilds heads from `data/attributes/<name>/label_map.json`. Modern checkpoints embed a full `attribute_config` dict and never read this folder. |
 | `models/unified/best.pt` | Your trained weights — too large for GitHub; get them onto the pod using the next section |
+
+*(Optional: `data/attributes/` only for some old checkpoints — skip unless you know you need it.)*
 
 ## Getting models from your machine onto RunPod
 
@@ -146,13 +145,49 @@ app.run(host='0.0.0.0', port=port, debug=False)
 
 ## Python dependencies
 
-Install these on the RunPod instance:
+On the pod:
 
 ```bash
 pip install flask flask-cors werkzeug opencv-python-headless
 ```
 
-Plus whatever `scripts/10_inference.py` needs (typically `torch`, `ultralytics`, `numpy`, etc.). Check the main repo's `requirements.txt` for the full list.
+Also install everything `scripts/10_inference.py` needs from the main repo’s `requirements.txt`.
+
+**GPU pods:** install a **CUDA-enabled** PyTorch build (CPU-only wheels will never use the GPU). Use the command from [pytorch.org](https://pytorch.org) that matches your CUDA version (check with `nvidia-smi` on the pod). Example shape:
+
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+```
+
+(Pick the `cu1xx` URL that matches what `nvidia-smi` reports.)
+
+## RunPod pod setup (GPU, ports, checks)
+
+**1. Pick a GPU template** — Create the pod from a template that includes an **NVIDIA** GPU and a recent CUDA driver. CPU-only pods cannot run CUDA inference.
+
+**2. Confirm the GPU is visible**
+
+```bash
+nvidia-smi
+```
+
+You should see your GPU and driver version. If this fails, fix the template / image before debugging Python.
+
+**3. Confirm PyTorch sees CUDA**
+
+```bash
+python3 -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
+```
+
+Expect `True` and a CUDA version string. If `False`, reinstall `torch` with a CUDA wheel (see above).
+
+**4. Web UI device = CUDA** — In `static/index.html`, the **Device** dropdown defaults to **CPU**. Users must choose **CUDA (GPU)** before **Analyze** (or use **Auto** if that resolves to CUDA on your stack). For a pod-only deployment you can change the default `<option>` to `cuda` in your fork so you do not rely on users switching it.
+
+**5. Expose the Flask port** — In RunPod, map the container port your app listens on (e.g. `5001`, or whatever you set `PORT` to) to the public **HTTP** port / proxy URL you put in `VITE_BACKEND_URL`.
+
+**6. Disk** — Leave enough volume space for `models/`, uploaded videos, and `results/` (annotated videos are large).
+
+**7. Timeouts** — Inference can run many minutes; use RunPod / proxy settings that do not cut off long requests or idle streaming for huge uploads.
 
 ## Running
 
@@ -222,7 +257,10 @@ no models/ in this repo.
 
 ## Production checklist
 
-- [ ] RunPod instance has GPU access and enough disk for models + video results
+- [ ] RunPod **GPU** template (not CPU-only); `nvidia-smi` works on the pod
+- [ ] PyTorch **CUDA** build installed; `torch.cuda.is_available()` is `True`
+- [ ] Analysis UI uses **CUDA (GPU)** or **Auto** (not left on default **CPU** unless intentional)
+- [ ] Enough disk for models + `results/`
 - [ ] `PROJECT_ROOT` in `app.py` points to the correct root (where `scripts/` and `models/` live)
 - [ ] CORS origin set to your Vercel domain
 - [ ] `debug=False` in Flask
