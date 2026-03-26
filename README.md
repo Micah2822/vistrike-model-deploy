@@ -14,8 +14,8 @@ This folder contains everything needed to deploy the VISTRIKE inference backend 
 │   - Upload.css               │                         │            style.css)             │
 │                              │                         │                                  │
 │  NO models, NO scripts,      │                         │  scripts/                        │
-│  NO testing-ui, NO Python    │                         │    10_inference.py                │
-│                              │                         │    inference_onnx.py              │
+│  NO testing-ui, NO Python    │                         │    10_inference.py, utils/ …     │
+│                              │                         │  configs/, data/attributes/      │
 │                              │                         │                                  │
 │                              │                         │  models/                         │
 │                              │                         │    unified/best.pt (etc.)        │
@@ -45,8 +45,18 @@ This folder contains everything needed to deploy the VISTRIKE inference backend 
 │       ├── app.js          # Analysis UI logic (upload, polling, playback, dashboard)
 │       └── style.css       # Analysis UI styles
 ├── scripts/
-│   ├── 10_inference.py     # Main PyTorch inference script
-│   └── inference_onnx.py   # ONNX inference variant
+│   ├── 10_inference.py     # CLI wrapper (imports utils)
+│   ├── inference_onnx.py   # ONNX entry (imports utils)
+│   └── utils/              # REQUIRED — pipeline implementation (batch_video_analyzer, ORT backend, …)
+│       ├── __init__.py
+│       ├── batch_video_analyzer.py
+│       ├── ort_video_backend.py
+│       ├── onnx_model_metadata.py
+│       └── onnx_export_wrappers.py
+├── configs/
+│   └── action_types.yaml   # Action types, colors, event keys (repo root relative to scripts/)
+├── data/
+│   └── attributes/         # label_map.json per attribute (cwd = PROJECT_ROOT when Flask runs inference)
 ├── models/
 │   └── unified/
 │       └── best.pt         # Trained model weights
@@ -64,6 +74,9 @@ This folder contains everything needed to deploy the VISTRIKE inference backend 
 | `testing-ui/static/style.css` | `Vistrike-Main-UI/testing-ui/static/style.css` |
 | `scripts/10_inference.py` | `scripts/10_inference.py` |
 | `scripts/inference_onnx.py` | `scripts/inference_onnx.py` |
+| `scripts/utils/` (entire package) | `scripts/utils/*.py` — **required**; `10_inference.py` does `from utils.batch_video_analyzer import …` with `cwd=PROJECT_ROOT`, so Python resolves `utils` as `scripts/utils` |
+| `configs/action_types.yaml` | `configs/action_types.yaml` — used by `batch_video_analyzer` (has in-code fallback if missing, but you want the real file in production) |
+| `data/attributes/` | `data/attributes/` — label maps for attribute heads; relative to **process cwd** (`PROJECT_ROOT`). If missing, you get a warning and some attribute labeling may degrade |
 | `models/unified/best.pt` | Your trained model weights |
 
 ## Required changes to `app.py`
