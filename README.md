@@ -76,8 +76,27 @@ This folder contains everything needed to deploy the VISTRIKE inference backend 
 | `scripts/inference_onnx.py` | `scripts/inference_onnx.py` |
 | `scripts/utils/` (entire package) | `scripts/utils/*.py` — **required**; `10_inference.py` does `from utils.batch_video_analyzer import …` with `cwd=PROJECT_ROOT`, so Python resolves `utils` as `scripts/utils` |
 | `configs/action_types.yaml` | `configs/action_types.yaml` — used by `batch_video_analyzer` (has in-code fallback if missing, but you want the real file in production) |
-| `data/attributes/` | `data/attributes/` — label maps for attribute heads; relative to **process cwd** (`PROJECT_ROOT`). If missing, you get a warning and some attribute labeling may degrade |
-| `models/unified/best.pt` | Your trained model weights |
+| `data/attributes/` | **Usually omit.** Not present in many clones. Only needed for **legacy** unified checkpoints where `attribute_config` in the `.pt` is a **list**; the code then rebuilds heads from `data/attributes/<name>/label_map.json`. Modern checkpoints embed a full `attribute_config` dict and never read this folder. |
+| `models/unified/best.pt` | Your trained weights — too large for GitHub; get them onto the pod using the next section |
+
+## Getting models from your machine onto RunPod
+
+1. **SCP over SSH** — RunPod shows **SSH** details on the pod page (host, port, key). SSH in once and run `mkdir -p /workspace/vistrike/models/unified` if needed. From your laptop:
+
+   ```bash
+   scp -i /path/to/key -P PORT ./best.pt root@POD_HOST:/workspace/vistrike/models/unified/best.pt
+   ```
+
+   Replace host, port, key path, and destination with your layout. Use `scp -r ./models root@POD_HOST:/workspace/vistrike/` to copy a whole `models` folder.
+
+2. **Upload to cloud, then download on the pod** — Put `best.pt` in S3, R2, etc. (or use a presigned URL). On the pod:
+
+   ```bash
+   mkdir -p /workspace/vistrike/models/unified
+   curl -L -o /workspace/vistrike/models/unified/best.pt "https://YOUR_DOWNLOAD_URL"
+   ```
+
+3. **RunPod Network Volume** — Attach a volume to the pod, copy weights onto it once (via SCP from your machine to the pod path that mounts the volume), so new pods can reuse the same volume without re-uploading.
 
 ## Required changes to `app.py`
 
@@ -212,5 +231,5 @@ no models/ in this repo.
 - [ ] Request timeout is long enough for inference (can take several minutes)
 - [ ] `GET /api/status` returns 200 so Upload page shows "connected"
 - [ ] `VITE_BACKEND_URL` set in Vercel dashboard and site redeployed
-- [ ] Model weights present at `models/unified/best.pt` (or `unified_mps/best.pt`)
+- [ ] Model weights present at `models/unified/best.pt`
 - [ ] Inference scripts present at `scripts/10_inference.py` and `scripts/inference_onnx.py`

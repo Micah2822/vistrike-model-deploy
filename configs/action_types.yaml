@@ -1,0 +1,156 @@
+# =============================================================================
+# VISTRIKE Action Types Configuration
+# =============================================================================
+# Single source of truth for action types. All types are FLAT (same level).
+# Mirrors the original ACTION_TAGS structure from 06_make_actions.py
+#
+# For each action type:
+#   - attributes: Column names to extract from annotations (hardcoded)
+#   - key_attributes: Important attributes for event display text and summary
+#     breakdowns (e.g. by_type, by_result). NOT used for event confidence
+#     unless confidence_attributes is omitted (see below).
+#   - confidence_attributes (optional): Attributes whose confidences drive event
+#     detection (each becomes attr_confidence, e.g. type → type_confidence).
+#     When omitted, falls back to key_attributes. Use this to exclude attributes
+#     whose confidence is always high and would inflate event counts (e.g. hand).
+#   - fighter_field: The annotation attribute that contains red/blue identity.
+#     When set, fighter_field_confidence is also included in event confidence keys
+#     for backward compatibility with old checkpoints (e.g. attacker_confidence).
+#   - fighter_key: The field used at inference to determine "who did it"
+#   - exclude_from_training: Attributes kept in CSVs but NOT used as model heads
+#
+# SIDE-BASED FIGHTER ASSIGNMENT:
+#   The action model does NOT learn red/blue corner identity (which is arbitrary
+#   and depends on detection). Instead, 06_make_actions.py derives a "_side"
+#   column (left/right) from box positions on the tag frame. The action model
+#   predicts "which side of the frame did the action". At inference,
+#   10_inference.py maps left/right back to red/blue using detection tracking.
+#
+#   This ensures consistent fighter assignment even when fighters wear
+#   indistinguishable gear (e.g. sparring footage without colored equipment).
+#
+# NOTE: The actual VALUES in these columns are discovered from annotations
+# and saved to label_maps by 06_make_actions.py. When label_groupings is
+# specified for an attribute, 06_make_actions.py maps raw annotation values
+# to canonical names BEFORE writing CSVs and building label_maps, so the
+# generated files contain only the merged/canonical class names.
+#
+# NOTE: Label Groupings
+#   - label_groupings (optional): Per-attribute mapping of canonical label
+#     names to lists of raw annotation values that collapse into them.
+#     Applied by 06_make_actions.py. Attributes without groupings keep
+#     their raw annotation values (current default behaviour).
+#
+# Used by:
+#   - 06_make_actions.py: Which columns to extract per action type
+#   - 09_train_actions.py: --action_type choices, exclude_from_training
+#   - 10_inference.py: Load models, fighter_key for event detection
+#   - 11_live_analysis.py: Load models
+#   - 12_export_onnx.py: Export action models
+#
+# Remove / add behaviour (nothing breaks):
+#   - Remove action type: No break. That type drops from the pipeline and
+#     from inference output; any existing models/actions/<type>/ is unused.
+#   - Add action type with no schema/data: No break when using
+#     --action_type all and inference (type skipped in training,
+#     detected: false at inference). Only explicitly training that single
+#     type with empty CSVs can cause an empty-dataset error.
+# =============================================================================
+
+# All action types (flat, same level)
+action_types:
+  punch:
+    attributes:
+      - attacker
+      - attacker_side
+      - hand
+      - type
+      - target
+      - lane
+      - result
+      - impact
+      - setup
+      - level_change
+      - counter_to
+      - combo_id
+    key_attributes: [attacker_side, hand, type, result]
+    confidence_attributes: [type, attacker_side, result]  # event confidence keys (hand excluded — always high, inflates event count)
+    fighter_field: attacker          # original red/blue from annotation
+    fighter_key: attacker_side       # model predicts left/right; inference maps to corner
+    exclude_from_training: [attacker, target, lane, impact, setup, level_change, counter_to, combo_id]  # red/blue kept in CSV, not a model head -> when advanced remove all besides 'attacker'
+    color_bgr: [0, 255, 255]  # Yellow
+    label_groupings: # Optional
+      result: 
+        landed: [landed_clean, landed_glancing]
+        blocked: [blocked, partially_blocked, parried]
+        missed: [missed, evaded]
+      type:
+        hook: [hook, uppercut, overhand]
+        jab: [jab]
+        cross: [cross]
+
+
+  defense:
+    attributes: [defender, defender_side, type, against, success]
+    key_attributes: [defender_side, type, success]
+    fighter_field: defender
+    fighter_key: defender_side
+    exclude_from_training: [defender, against]  # against is ill-posed: requires seeing the attacker's action, not observable from defender clip
+    color_bgr: [0, 255, 0]  # Green
+    label_groupings: # Optional
+      type:
+        block: [high_guard, block_body, catch, parry]
+        slip: [slip_left, slip_right, roll]
+        retreat: [step_back, pull, clinch_initiate]
+
+  footwork:
+    attributes: [fighter, fighter_side, type, purpose, pressure]
+    key_attributes: [fighter_side, type]
+    fighter_field: fighter
+    fighter_key: fighter_side
+    exclude_from_training: [fighter]
+    color_bgr: [255, 0, 255]  # Magenta
+
+  clinch:
+    attributes: [initiator, initiator_side, state, work_in_clinch, ref_action]
+    key_attributes: [initiator_side, state]
+    fighter_field: initiator
+    fighter_key: initiator_side
+    exclude_from_training: [initiator]
+    color_bgr: [0, 165, 255]  # Orange
+
+  knockdown:
+    attributes: [fighter, fighter_side, type, round]
+    key_attributes: [fighter_side, type]
+    fighter_field: fighter
+    fighter_key: fighter_side
+    exclude_from_training: [fighter]
+    color_bgr: [0, 0, 255]  # Red
+
+  wobble:
+    attributes: [fighter, fighter_side, severity, recovery]
+    key_attributes: [fighter_side, severity]
+    confidence_attributes: [type, fighter_side, severity]  # includes type (general action-type confidence)
+    fighter_field: fighter
+    fighter_key: fighter_side
+    exclude_from_training: [fighter]
+    color_bgr: [0, 128, 255]  # Orange-red
+
+  stoppage:
+    attributes: [type, reason, round]
+    key_attributes: [type, reason]
+    confidence_attributes: [type]  # reason excluded — only type drives event detection
+    fighter_field: ~              # stoppage has no single fighter
+    fighter_key: ~
+    exclude_from_training: []
+    color_bgr: [128, 0, 128]  # Purple
+
+# Tags to ignore when parsing (not action types)
+ignored_tags:
+  - bell
+
+# Visualization colors for non-action elements
+visualization_colors:
+  red: [0, 0, 255]
+  blue: [255, 0, 0]
+  unknown: [128, 128, 128]

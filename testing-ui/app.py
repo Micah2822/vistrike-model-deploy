@@ -22,14 +22,14 @@ from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
 
 app = Flask(__name__, static_folder='static', static_url_path='')
-CORS(app)
+CORS(app, origins=["https://vistrike.com"])
 
 # Configure max file size
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB
 
 # Get project root (grandparent of testing-ui/, i.e. VISTRIKE-AI-Official/)
 # Path: Vistrike-Main-UI/testing-ui/app.py -> parent.parent.parent = VISTRIKE-AI-Official
-PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
+PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 # Configuration (use absolute paths)
 # Save uploads in testing-ui/uploads (cleaned after processing)
@@ -848,4 +848,4 @@ if __name__ == '__main__':
     print(f"Results folder: {RESULTS_FOLDER}")
     print(f"{'='*60}\n")
     
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host='0.0.0.0', port=port, debug=False)
