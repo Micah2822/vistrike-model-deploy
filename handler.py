@@ -354,10 +354,20 @@ def handler(job):
             analysis_url = None
             video_url_out = None
 
+            print(
+                "Supabase config check:",
+                {
+                    "SUPABASE_URL_set": bool(SUPABASE_URL),
+                    "SUPABASE_KEY_set": bool(SUPABASE_KEY),
+                    "SUPABASE_KEY_len": len(SUPABASE_KEY or ""),
+                    "SUPABASE_BUCKET": SUPABASE_BUCKET,
+                },
+            )
             if _supabase_configured():
                 _progress(job, "Uploading results…", 92, "uploading_results",
                           log_buffer)
                 prefix = f"results/{job_id}"
+                print("Entering Supabase upload block", {"job_id": job_id, "prefix": prefix})
                 summary_url = supabase_upload(summary_path,
                                               f"{prefix}/summary.json")
                 analysis_url = supabase_upload(analysis_path,

@@ -1458,6 +1458,10 @@ class BoxingAnalyzer:
                     p['confidence'] for p in frame_result.get('persons', [])
                     if 'confidence' in p
                 ]
+                score_range = (
+                    f"{min(confs):.4f}-{max(confs):.4f}"
+                    if confs else "unknown"
+                )
                 progress_callback(
                     current_frame=frame_idx,
                     total_frames=total_frames,
@@ -1466,6 +1470,9 @@ class BoxingAnalyzer:
                     avg_confidence=sum(confs) / len(confs) if confs else 0.0,
                     video_resolution=f"{width}x{height}",
                     video_fps=fps,
+                    score_range=score_range,
+                    detection_threshold=self.confidence,
+                    boxes_above_threshold=boxes,
                 )
         
         cap.release()
