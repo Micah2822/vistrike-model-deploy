@@ -151,7 +151,9 @@ docker push yourdockerhub/vistrike-worker:v1.0.0
 |----------|------|------|
 | **Bake into image** (`COPY models/`) | Simple, reproducible | Image is huge; rebuild on weight changes |
 | **Download at startup** (add download step before `load_model()`) | Small image | First cold start is slower |
-| **RunPod network volume** | Shared across workers, fast attach | Requires volume setup in RunPod console |
+| **RunPod network volume** | Shared across workers, fast attach | Upload `models/…` via RunPod S3 API; attach on endpoint — handler auto-uses `/runpod-volume/models` when `/app/models` has no unified checkpoint |
+
+**Network volume (detailed):** create volume → S3 API key in Settings → `aws configure` → `aws s3 sync ./models s3://VOLUME_ID/models --region DATACENTER --endpoint-url https://s3api-….runpod.io/` → attach volume under endpoint **Advanced → Network Volumes**. Full steps: **[RUNPOD.md — Network volume: upload from your machine](RUNPOD.md#network-volume-upload-from-your-machine)**.
 
 ---
 

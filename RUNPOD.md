@@ -21,21 +21,55 @@ Or use **RunPod GitHub integration** to build directly from a repo.
 
 ---
 
-## 2. Create a serverless endpoint
+## 2. Create a serverless endpoint (current RunPod wizard)
 
-Go to **[Serverless → Endpoints → + New Endpoint](https://www.runpod.io/console/serverless)**.
+Open **Serverless** in the console and start **Deploy a New Endpoint** (or **Create a new deployment**). You should see a multi-step flow.
 
-| Setting | Recommended value |
-|---------|-------------------|
-| **Endpoint name** | `vistrike-inference` |
-| **Worker image** | `yourdockerhub/vistrike-worker:latest` |
-| **GPU type** | 16 GB VRAM (e.g. A4000, A5000) — see GPU sizing below |
-| **Min workers** | `0` (scale to zero = no cost when idle) |
+Official field reference: [Endpoint settings](https://docs.runpod.io/serverless/endpoints/endpoint-configurations).
+
+### Screen A — Choose how to deploy
+
+Pick **Custom deployment** (not "Start from a template" or "Run code locally").
+
+Then choose **one** of:
+
+| Path | When to use |
+|------|-------------|
+| **Deploy from Github** | RunPod builds the image from your repo. Repo must contain the `Dockerfile` at the path you set. Models usually **not** in Git — use a network volume (see **Getting models into the worker**). |
+| **Deploy from docker registry** | You already ran `docker build` + `docker push`. Paste the full image name (e.g. Docker Hub `YOUR_USER/vistrike-worker:latest`). |
+
+**If GitHub:** set **Branch** (e.g. `main`), **Dockerfile Path** (often `Dockerfile` or `./Dockerfile`), **Build Context** (usually repo root: `/` or blank). Wait until the UI shows the Dockerfile was found.
+
+**"Could not find runpod.serverless.start()…"** — RunPod scans your **default GitHub branch** for this call. If you see this warning: make sure `handler.py` (which contains `runpod.serverless.start` at the bottom) is committed and pushed to that branch. Wait a few minutes for GitHub indexing. You can continue if the scanner is wrong and your branch is correct.
+
+### Screen B — Configure Endpoint
+
+| Field | What to do |
+|-------|------------|
+| **Endpoint name** | e.g. `vistrike-inference` (any label you like). |
+| **Endpoint type** | **Queue-based.** This project uses a Python handler + `runpod.serverless.start()` and the async **`/run`** API. Do **not** pick load-balancing. |
+| **Worker type** | Use RunPod's default or **Enhanced** depending on budget. |
+| **GPU configuration** | Pick a GPU with enough VRAM — see **GPU sizing** below (~16 GB recommended). |
+| **Model** (Hugging Face link / model name) | **Leave empty.** VISTRIKE loads weights from **`/app/models`** or **`/runpod-volume/models`** (see **Getting models into the worker**), not from Hugging Face. |
+| **Container start command** | **Leave blank** so the image uses its Dockerfile **CMD** (`python -u /app/handler.py`). |
+| **Container disk** | **20** GB or more (video download + annotated output). |
+| **Expose HTTP ports** / **Expose TCP ports** | **Leave empty** for this serverless handler. |
+| **Environment variables** | Add the vars from **Step 3** below. Use **Secrets** (lock icon) for `SUPABASE_SERVICE_ROLE_KEY`. |
+
+### Screen C — Deploy
+
+Confirm **Deploy Serverless Endpoint**. Pricing shows at the bottom.
+
+**Scaling (Active workers, idle timeout, execution timeout):** These may **not** appear on the initial deploy screen. After the endpoint exists, open it → **Edit** / **Settings** and look for:
+
+| Setting | Recommended |
+|---------|-------------|
+| **Active workers** (old name: "min workers") | `0` — scale to zero, no idle GPU cost |
 | **Max workers** | `1` (increase for concurrency) |
 | **Idle timeout** | `60` seconds |
-| **Execution timeout** | `600000` ms (10 min) |
-| **Container disk** | `20` GB+ (temp video + output) |
-| **Network volume** | (optional) mount at `/app/models` if models are not baked in |
+| **Execution timeout** | `600` seconds (10 min) |
+
+**Network volume:** If weights are not baked into the image, attach a volume under **Advanced → Network Volumes** (see **Getting models into the worker**).
 
 ---
 
@@ -175,11 +209,102 @@ Test with your **longest / highest-resolution clip** to find the right tier.
 
 ## Getting models into the worker
 
+The handler picks a weights directory automatically: **`MODELS_DIR`** env if set; otherwise **`/app/models`** when it contains **`unified/best.pt`** (or **`last.pt`** / **`unified_mps/…`**); otherwise **`/runpod-volume/models`** when that path has a unified checkpoint (RunPod attaches network volumes at **`/runpod-volume`**). Upload with S3 using prefix **`models/…`** so files land under **`/runpod-volume/models`**.
+
 | Strategy | How |
 |----------|-----|
 | **Bake into image** | Uncomment `COPY models/ /app/models/` in `Dockerfile`. Rebuild on weight changes. |
-| **Download at startup** | Add a download step in `handler.py` before `load_model()`. Slower first cold start. |
-| **Network volume** | Create a RunPod volume, upload weights, mount at `/app/models` in endpoint config. |
+| **Network volume** | Create volume → upload **`models/unified/best.pt`** via [S3 API](https://docs.runpod.io/storage/s3-api) (`aws s3 sync ./models s3://VOLUME_ID/models …`) → attach volume on the serverless endpoint (**Advanced → Network Volumes**). No env var required if the image has no conflicting weights under **`/app/models`**. |
+| **Download at startup** | Add a download step before `load_model()` into **`/app/models`** or set **`MODELS_DIR`**. Not implemented in-repo. |
+| **`MODELS_DIR` override** | Set on the endpoint if you store weights somewhere else entirely. |
+
+### Network volume: upload from your machine
+
+Paths like **`/app`** and **`/runpod-volume`** are **inside the Docker container on RunPod**, not names of your GitHub repo or local folder. Your repo can be called anything; on disk you still use a **`models/`** folder with **`unified/best.pt`** (and optional **`models/actions/…`**) when uploading.
+
+**1. Create a network volume**
+
+- Open **[RunPod → Storage](https://www.console.runpod.io/user/storage)** → **New Network Volume**.
+- Choose **size**, **name**, and **data center**. The data center must support the **S3-compatible API** (see [RunPod S3 API — datacenters](https://docs.runpod.io/storage/s3-api#datacenter-availability)); each region has its own endpoint URL (e.g. `EU-RO-1` → `https://s3api-eu-ro-1.runpod.io/`).
+- After creation, copy the volume **ID** — this string is the S3 **bucket** name for the CLI.
+
+**2. Create an S3 API key (separate from your normal RunPod API key)**
+
+- **Settings** → **S3 API Keys** → **Create**.
+- Save the **access key** (e.g. `user_…`) and **secret** (e.g. `rps_…`). The secret is shown **once**.
+
+**3. Install AWS CLI and configure credentials**
+
+Install [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), then:
+
+```bash
+aws configure
+```
+
+- **AWS Access Key ID:** your RunPod S3 access key (`user_…`).
+- **AWS Secret Access Key:** your RunPod S3 secret (`rps_…`).
+- **Default region:** your volume’s **data center ID** exactly (e.g. `EU-RO-1`). It must match the volume and the S3 endpoint host.
+- **Output format:** `json` or leave blank.
+
+**4. Prepare a local `models` tree**
+
+From your laptop, you need at least:
+
+```text
+models/unified/best.pt
+```
+
+Optional: `models/unified/last.pt`, `models/unified_mps/…`, `models/actions/<type>/best.pt`, etc. — same layout as local inference.
+
+**5. Upload with `aws s3 sync`**
+
+Run this from the directory that **contains** the `models` folder (not inside `models`). Replace:
+
+- `YOUR_VOLUME_ID` — volume ID from step 1.
+- `EU-RO-1` — your data center ID.
+- `https://s3api-eu-ro-1.runpod.io/` — the endpoint for **your** data center from the [S3 API table](https://docs.runpod.io/storage/s3-api#datacenter-availability).
+
+```bash
+aws s3 sync ./models "s3://YOUR_VOLUME_ID/models" \
+  --region EU-RO-1 \
+  --endpoint-url "https://s3api-eu-ro-1.runpod.io/"
+
+# should be:
+
+aws s3 sync ./models "s3://28td86o173/models" \
+  --region EU-RO-1 \
+  --endpoint-url "https://s3api-eu-ro-1.runpod.io/"
+```
+
+This writes keys under `models/…` on the volume. On a serverless worker that appears as **`/runpod-volume/models/…`**. The handler will auto-select that path when **`/app/models`** has no unified checkpoint (see intro above).
+
+**6. Verify**
+
+```bash
+aws s3 ls "s3://YOUR_VOLUME_ID/models" \
+  --region EU-RO-1 \
+  --endpoint-url "https://s3api-eu-ro-1.runpod.io/"
+```
+
+**7. Large uploads / flaky transfers**
+
+```bash
+export AWS_RETRY_MODE=standard
+export AWS_MAX_ATTEMPTS=10
+```
+
+Then re-run `sync`. For very large files RunPod also documents multipart / timeout tweaks in the [S3 API guide](https://docs.runpod.io/storage/s3-api).
+
+**8. Attach the volume to your serverless endpoint**
+
+- **Serverless** → your endpoint → **Manage** → **Edit Endpoint**.
+- **Advanced** → **Network Volumes** → select this volume → **Save**.
+
+Attaching ties workers to that volume’s **data center**, which can limit GPU availability vs “any region.”
+
+**9. Redeploy / save**
+
+Ensure the worker image does **not** ship a stale **`unified/best.pt`** under **`/app/models`** if you want the volume weights to win (keep `COPY models/` commented out in `Dockerfile` for image-only code).
 
 ---
 
@@ -217,10 +342,10 @@ Set **Idle timeout** higher (e.g. 120 s) to keep the worker warm between jobs.
 
 ### "Models not found" on startup
 
-- If baking in: make sure `models/` is present before `docker build` and
-  `COPY models/` is uncommented in the Dockerfile.
-- If using a volume: verify the mount path resolves to `/app/models`.
-- Required minimum: `models/unified/best.pt`.
+- Check worker logs for **`Using models_dir=…`**.
+- **Baked in:** `models/` on build machine and `COPY models/ /app/models/` uncommented.
+- **Volume:** S3 sync uses prefix **`s3://VOLUME_ID/models`** so **`unified/best.pt`** exists at **`/runpod-volume/models/unified/best.pt`**, and **`/app/models`** must not contain a stale **`unified/best.pt`** (otherwise baked path wins). Clear **`MODELS_DIR`** unless overriding.
+- Required: **`unified/best.pt`** or **`unified/last.pt`** (or **`unified_mps/…`**).
 
 ---
 

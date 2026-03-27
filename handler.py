@@ -12,6 +12,9 @@ Environment variables (set in RunPod dashboard → endpoint → secrets):
   DEFAULT_CONFIDENCE        – detection threshold (default 0.5)
   DEFAULT_ATTR_CONFIDENCE   – attribute threshold (default 0.0)
   DEFAULT_ACTION_CONFIDENCE – action event threshold (default 0.6)
+  MODELS_DIR                – optional override for weights directory. If unset,
+                            uses /app/models when it contains a unified checkpoint,
+                            else /runpod-volume/models (RunPod network volume).
 """
 
 import os
@@ -89,13 +92,41 @@ def _supabase_configured() -> bool:
 MODEL = None
 
 
+def _unified_checkpoint_present(models_root: Path) -> bool:
+    """True if a unified model artifact is present under models_root (.pt or ONNX)."""
+    u = models_root / "unified"
+    m = models_root / "unified_mps"
+    for base in (u, m):
+        if (base / "best.pt").exists() or (base / "last.pt").exists():
+            return True
+    if (u / "unified_model.onnx").exists():
+        return True
+    return False
+
+
+def _resolve_models_dir() -> str:
+    """Pick weights directory: MODELS_DIR env, else baked /app/models, else volume."""
+    override = os.environ.get("MODELS_DIR", "").strip()
+    if override:
+        return override
+    app_models = PROJECT_ROOT / "models"
+    vol_models = Path("/runpod-volume/models")
+    if _unified_checkpoint_present(app_models):
+        return str(app_models)
+    if _unified_checkpoint_present(vol_models):
+        return str(vol_models)
+    return str(app_models)
+
+
 def load_model():
     global MODEL
     if MODEL is not None:
         return MODEL
     device = "cuda" if os.environ.get("DEVICE", "cuda") != "cpu" else "cpu"
+    models_dir = _resolve_models_dir()
+    print(f"Using models_dir={models_dir}")
     MODEL = BoxingAnalyzer(
-        models_dir=str(PROJECT_ROOT / "models"),
+        models_dir=models_dir,
         device=device,
         confidence=float(os.environ.get("DEFAULT_CONFIDENCE", "0.5")),
         attr_confidence=float(os.environ.get("DEFAULT_ATTR_CONFIDENCE", "0.0")),
