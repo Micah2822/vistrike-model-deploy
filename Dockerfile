@@ -14,7 +14,7 @@ COPY configs/ /app/configs/
 COPY handler.py /app/handler.py
 
 # Models are NOT baked in (too large).
-# Either: mount a volume, download at startup, or use RunPod model caching.
+# Either: mount a volume, download at startup, or use RunPod network volume.
 # To bake in (if you want): uncomment the next line.
 # COPY models/ /app/models/
 

@@ -1,224 +1,233 @@
-# VISTRIKE Serverless Inference (RunPod + Vercel)
+# VISTRIKE — RunPod Serverless GPU Worker
 
-**No always-on VM.** RunPod Serverless scales to zero — you pay only while inference runs.
+Self-contained Docker image that runs boxing-video inference on RunPod
+Serverless. Scales to zero — you pay only while a job runs.
 
-RunPod console config, GPU sizing, env vars, endpoint settings: **[RUNPOD.md](./RUNPOD.md)**
+Results (summary JSON, frame-by-frame analysis JSON, optional annotated MP4)
+are uploaded to **Supabase Storage** so the Vercel front-end can display
+charts and dashboards.
 
 ---
 
-## Architecture
+## Prerequisites
+
+| Requirement | Why |
+|-------------|-----|
+| **Docker** (Desktop or CLI) | Build + push the worker image |
+| **Docker Hub / GHCR account** | Host the image so RunPod can pull it |
+| **RunPod account** | Create the serverless endpoint |
+| **Supabase project** | Storage bucket for inference artifacts |
+| **Model weights** in `models/` | Baked into the image, downloaded at startup, or on a RunPod network volume |
+
+> If your model weights live in a monorepo, copy or symlink `models/unified/best.pt`
+> (and any action sub-models) into this folder before building.
+
+### Supabase (one-time, before RunPod)
+
+1. **Create a project** at [supabase.com](https://supabase.com/dashboard) (free tier is fine).
+2. **Storage → New bucket** — name it something memorable (e.g. `vistrike-results`). That exact name is what you set as `SUPABASE_BUCKET` on RunPod.
+3. **Public vs private** — The worker returns **public** object URLs (`/storage/v1/object/public/...`). For the dashboard to load JSON and MP4 in the browser without extra auth, turn **Public bucket** on for that bucket (Storage → bucket → **Public**). If you keep the bucket private, you must serve files via your own API with signed URLs; the URLs returned by the worker alone will not work in `<video>` / `fetch` without auth.
+4. **Project URL + service role** — **Project Settings → API**: copy **Project URL** → `SUPABASE_URL` (looks like `https://<project-ref>.supabase.co`). Copy **service_role** `secret` → `SUPABASE_SERVICE_ROLE_KEY`. Use **service_role** only on RunPod (server-side); never put it in the browser or Vercel client bundles. The **anon** key is for the front-end if you use Supabase client-side for uploads.
+5. **Layout** — One bucket is enough: your upload flow writes user clips under `uploads/…`; the GPU worker writes `results/<job_id>/summary.json`, `analysis.json`, and optional `annotated.mp4` (see path table below).
+
+---
+
+## Folder tree
 
 ```
-┌─────────────────────────────┐         ┌──────────────────────┐         ┌──────────────────────┐
-│  VERCEL                     │         │  OBJECT STORAGE      │         │  RUNPOD SERVERLESS   │
-│                             │         │  (R2 / S3)           │         │                      │
-│  React app + analysis UI    │         │                      │         │  handler.py          │
-│  Vercel API routes:         │         │  uploads/video.mp4   │         │  scripts/            │
-│    /api/upload-url ─────────│────▶    │  results/job-id/     │    ◀────│  models/             │
-│    /api/analyze ────────────│─────────│──────────────────────│────▶    │  configs/            │
-│    /api/progress/:id ───────│─────────│──────────────────────│────▶    │                      │
-│    /api/results ────────────│────▶    │                      │         │                      │
-└─────────────────────────────┘         └──────────────────────┘         └──────────────────────┘
+vistrike-model-deploy/
+├── handler.py              ← RunPod serverless entry point
+├── Dockerfile
+├── requirements.txt
+├── configs/
+│   └── action_types.yaml   ← action-type definitions (punch, defense, …)
+├── scripts/
+│   ├── 10_inference.py
+│   ├── 11_live_analysis.py
+│   ├── inference_onnx.py
+│   ├── validate_onnx_parity.py
+│   └── utils/
+│       ├── __init__.py
+│       ├── batch_video_analyzer.py
+│       ├── onnx_export_wrappers.py
+│       ├── onnx_model_metadata.py
+│       └── ort_video_backend.py
+├── models/                 ← gitignored; see "Getting models in" below
+│   ├── unified/best.pt
+│   └── actions/…
+├── README.md               ← this file
+└── RUNPOD.md               ← RunPod console setup, env vars, API ref
 ```
 
-**Flow:**
-1. User picks a video in the browser (Vercel)
-2. Vercel API route generates a **presigned upload URL** → browser uploads video to R2/S3
-3. Vercel API route calls **RunPod `/run`** with `video_url` + params + `s3Config`
-4. RunPod worker (`handler.py`) downloads video, runs inference, uploads results to R2/S3, returns summary
-5. Browser polls **Vercel `/api/progress/:jobId`** → Vercel polls **RunPod `/status/:jobId`**
-6. When done, browser fetches results from R2/S3
+### What is gitignored vs. copied at build time
 
-**No iframe. No Flask. No always-on server.**
-
----
-
-## What's in this folder
-
-| File | What it does |
-|------|-------------|
-| **`handler.py`** | RunPod serverless worker — downloads video, runs `BoxingAnalyzer`, uploads results to storage, returns summary + URLs |
-| **`Dockerfile`** | Builds the Docker image for the worker (PyTorch + CUDA + scripts) |
-| **`requirements.txt`** | Python deps for the worker image |
-| **`RUNPOD.md`** | RunPod console setup — endpoint creation, GPU sizing, env vars, model loading, API reference |
+| Path | In git? | In Docker image? | Notes |
+|------|---------|-------------------|-------|
+| `handler.py` | Yes | Yes | Entrypoint |
+| `scripts/` | Yes | Yes | Inference pipeline |
+| `configs/` | Yes | Yes | Action type YAML |
+| `models/` | **No** (gitignored) | Optional — see below | Too large for git |
+| `testing-ui/` | **No** (deleted) | **No** | Obsolete Flask UI; not part of worker |
+| `__pycache__/`, `*.pyc` | No | No | Excluded by `.dockerignore` |
 
 ---
 
-## What goes where
+## Quick start (numbered)
 
-### RunPod (this folder → Docker image)
-
-| In the image | Source |
-|--------------|--------|
-| `handler.py` | This folder |
-| `scripts/10_inference.py` | `scripts/10_inference.py` |
-| `scripts/inference_onnx.py` | `scripts/inference_onnx.py` |
-| `scripts/utils/` (full folder) | `scripts/utils/` |
-| `configs/action_types.yaml` | `configs/action_types.yaml` |
-| `models/unified/best.pt` | Your weights — bake in, download at startup, or use network volume ([RUNPOD.md](./RUNPOD.md)) |
-
-### Vercel (the other repo)
-
-| What | Purpose |
-|------|---------|
-| React app (Home, About, etc.) | Main site |
-| `Upload.jsx` + `Upload.css` | Upload page — **rewritten: no iframe**, calls Vercel API routes |
-| `testing-ui/static/*` (`index.html`, `app.js`, `style.css`) | Analysis UI — served from Vercel as static files, `API_BASE` points to Vercel API routes |
-| **Vercel API routes** (new) | `/api/upload-url`, `/api/analyze`, `/api/progress/:id`, `/api/results` — proxy to RunPod + R2 |
-
-### Object storage (R2 / S3)
-
-One bucket with two prefixes:
-- `uploads/` — user videos (presigned PUT from browser)
-- `results/{job_id}/` — `summary.json`, `analysis.json`, `annotated.mp4` (written by handler)
-
----
-
-## Build and deploy the worker
+### 1. Clone / copy this folder
 
 ```bash
-cd vistrike-runpod-deploy
+git clone <your-remote> vistrike-model-deploy
+cd vistrike-model-deploy
+```
+
+If scripts or configs come from a monorepo, sync them:
+
+```bash
+cp -r /path/to/monorepo/scripts ./scripts
+cp -r /path/to/monorepo/configs ./configs
+```
+
+### 2. Place model weights
+
+```bash
+mkdir -p models/unified
+cp /path/to/best.pt models/unified/best.pt
+# Optional action sub-models:
+mkdir -p models/actions/punch models/actions/defense
+cp /path/to/punch_model/* models/actions/punch/
+cp /path/to/defense_model/* models/actions/defense/
+```
+
+Or uncomment `COPY models/ /app/models/` in the Dockerfile to bake them in.
+
+### 3. Build the Docker image
+
+```bash
 docker build -t yourdockerhub/vistrike-worker:latest .
+```
+
+### 4. (Optional) Test locally
+
+```bash
+# Requires GPU + models present in models/
+docker run --rm --gpus all \
+  -e DEVICE=cuda \
+  -v $(pwd)/models:/app/models \
+  yourdockerhub/vistrike-worker:latest \
+  python -u /app/handler.py --test_input '{
+    "input": {
+      "video_url": "https://example.com/test.mp4",
+      "confidence": 0.5,
+      "save_video": false
+    }
+  }'
+```
+
+### 5. Push to registry
+
+```bash
 docker push yourdockerhub/vistrike-worker:latest
 ```
 
-Then create a serverless endpoint in RunPod console pointing at this image. Full steps in **[RUNPOD.md](./RUNPOD.md)**.
+### 6. Create RunPod serverless endpoint
 
----
+See **[RUNPOD.md](./RUNPOD.md)** for step-by-step console instructions,
+every environment variable, and a test curl command.
 
-## Vercel env vars (set in dashboard)
+### 7. Tag a release (optional)
 
-| Variable | Value |
-|----------|-------|
-| `RUNPOD_ENDPOINT_ID` | Your RunPod serverless endpoint ID |
-| `RUNPOD_API_KEY` | Your RunPod API key |
-| `R2_ENDPOINT_URL` | e.g. `https://xxxx.r2.cloudflarestorage.com` |
-| `R2_ACCESS_KEY_ID` | R2 access key |
-| `R2_SECRET_ACCESS_KEY` | R2 secret |
-| `R2_BUCKET_NAME` | e.g. `vistrike-data` |
-
----
-
-## Prompt to give Claude on the Vercel repo
-
-```
-We're switching from an iframe + Flask backend to RunPod Serverless.
-All static files from testing-ui/ are already copied into this repo.
-Upload.jsx and Upload.css are already in src/pages/.
-
-Here's the new architecture:
-- NO iframe. NO Flask server. NO VITE_BACKEND_URL.
-- The analysis UI (testing-ui/static/index.html, app.js, style.css) 
-  is served from THIS repo as static assets under public/analysis/ 
-  (or similar).
-- Vercel API routes proxy between the browser and RunPod Serverless + R2.
-- Object storage (Cloudflare R2) holds uploaded videos and inference results.
-
-I need you to implement:
-
-1. VERCEL API ROUTES (src/api/ or app/api/ depending on framework):
-
-   a) POST /api/upload-url
-      - Generates a presigned PUT URL for R2 so the browser can upload 
-        the video directly to storage.
-      - Input: { filename, contentType }
-      - Output: { uploadUrl, videoKey }
-      - Uses env vars: R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, 
-        R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME
-
-   b) POST /api/analyze
-      - Calls RunPod serverless: POST https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/run
-      - Auth: Authorization: Bearer {RUNPOD_API_KEY}
-      - Body: {
-          "input": {
-            "video_url": "<R2 public/presigned URL for the uploaded video>",
-            "confidence": <from request>,
-            "attr_confidence": <from request>,
-            "save_video": <from request>
-          },
-          "s3Config": {
-            "accessId": R2_ACCESS_KEY_ID,
-            "accessSecret": R2_SECRET_ACCESS_KEY,
-            "bucketName": R2_BUCKET_NAME,
-            "endpointUrl": R2_ENDPOINT_URL
-          }
-        }
-      - Output: { jobId } (from RunPod response.id)
-      - Uses env vars: RUNPOD_ENDPOINT_ID, RUNPOD_API_KEY, R2_*
-
-   c) GET /api/progress/:jobId
-      - Calls RunPod: GET https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/status/{jobId}
-      - Auth: Authorization: Bearer {RUNPOD_API_KEY}
-      - Returns the RunPod status response to the browser.
-        status will be IN_QUEUE, IN_PROGRESS, COMPLETED, or FAILED.
-        When IN_PROGRESS, output may contain progress_update data
-        (percent, status message).
-        When COMPLETED, output contains summary + result URLs.
-
-   d) GET /api/results/:key
-      - Fetches a file from R2 and streams it to the browser.
-      - Used for analysis.json, summary.json, annotated video.
-      - Or: generate a presigned GET URL and redirect.
-
-2. UPDATE testing-ui/static/app.js (now at public/analysis/app.js 
-   or wherever you placed it):
-   - Change API_BASE from '' to '' (or wherever Vercel API routes live 
-     — should be same origin so '' works).
-   - Replace the analyzeVideo() function flow:
-     OLD: FormData upload to /api/analyze, poll /api/progress, 
-          fetch /api/results.
-     NEW:
-       a) Call /api/upload-url to get presigned URL
-       b) PUT the video file directly to that URL (show upload progress)
-       c) Call /api/analyze with the video key + params → get jobId
-       d) Poll /api/progress/:jobId until COMPLETED
-       e) Read results from the COMPLETED response output (summary 
-          inline, result URLs for video/analysis.json)
-   - The progress response shape changes:
-     OLD: { status, current_frame, total_frames, ... }
-     NEW: RunPod status: { status: "IN_PROGRESS", 
-          output: { status: "analyzing", percent: 50 } }
-     Map appropriately in the polling UI.
-   - Results: summary comes inline in COMPLETED output. Annotated 
-     video URL comes from output.video_url. analysis.json from 
-     output.analysis_url.
-   - Remove checkServerStatus() or adapt it to call /api/analyze 
-     health endpoint or just show "ready".
-
-3. UPDATE Upload.jsx:
-   - Remove the iframe entirely.
-   - Instead, either:
-     a) Embed the analysis page directly (import the HTML/JS), or
-     b) Route to a page that loads the static analysis UI 
-        (simplest: put index.html content in a React component, 
-        or load public/analysis/index.html in the page).
-   - Remove VITE_BACKEND_URL references.
-   - Remove the "backend not running" warning (there's no backend 
-     to check — RunPod scales on demand).
-
-4. ENV VARS needed in Vercel dashboard:
-   RUNPOD_ENDPOINT_ID, RUNPOD_API_KEY,
-   R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME
-
-The RunPod serverless handler (handler.py) is already deployed 
-separately — you don't need to touch it. It expects:
-- input.video_url (URL to download the video from)
-- input.confidence, input.attr_confidence, input.save_video
-- s3Config for uploading results
-- Returns: { status, summary, summary_url, analysis_url, video_url }
-- Progress updates during processing (percent + status string)
+```bash
+docker tag yourdockerhub/vistrike-worker:latest \
+           yourdockerhub/vistrike-worker:v1.0.0
+docker push yourdockerhub/vistrike-worker:v1.0.0
 ```
 
 ---
 
-## Checklist
+## Getting models into the worker
 
-- [ ] Docker image built and pushed
-- [ ] RunPod serverless endpoint created with correct GPU, env vars, image
-- [ ] R2/S3 bucket created with access keys
-- [ ] Models in the image (baked, downloaded, or on volume)
-- [ ] Vercel API routes implemented (upload-url, analyze, progress, results)
-- [ ] `app.js` updated for new flow (presigned upload → RunPod job → poll → results)
-- [ ] `Upload.jsx` updated (no iframe)
-- [ ] Vercel env vars set: `RUNPOD_ENDPOINT_ID`, `RUNPOD_API_KEY`, `R2_*`
-- [ ] Test end-to-end: upload video → inference → view results
+| Strategy | Pros | Cons |
+|----------|------|------|
+| **Bake into image** (`COPY models/`) | Simple, reproducible | Image is huge; rebuild on weight changes |
+| **Download at startup** (add download step before `load_model()`) | Small image | First cold start is slower |
+| **RunPod network volume** | Shared across workers, fast attach | Requires volume setup in RunPod console |
+
+---
+
+## Job input / output reference
+
+### Input (`job["input"]`)
+
+```json
+{
+  "video_url": "https://<project-ref>.supabase.co/storage/v1/object/public/<bucket>/uploads/video.mp4",
+  "confidence": 0.5,
+  "attr_confidence": 0.0,
+  "action_confidence": 0.6,
+  "save_video": true
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `video_url` | string | **(required)** | HTTPS URL to the source video |
+| `confidence` | float | `0.5` | Detection confidence threshold |
+| `attr_confidence` | float | `0.0` | Attribute confidence threshold |
+| `action_confidence` | float | `0.6` | Action event confidence threshold |
+| `save_video` | bool | `true` | Generate annotated MP4 |
+
+> `device` is ignored — the worker always uses the GPU it was launched on.
+
+### Output (returned in RunPod `COMPLETED` response `.output`)
+
+```json
+{
+  "status": "completed",
+  "elapsed_seconds": 42.3,
+  "total_frames": 1800,
+  "summary": { "…inline summary dict…" },
+  "summary_url": "https://xxxx.supabase.co/storage/v1/object/public/vistrike-results/results/job-abc/summary.json",
+  "analysis_url": "https://xxxx.supabase.co/storage/v1/object/public/vistrike-results/results/job-abc/analysis.json",
+  "video_url": "https://xxxx.supabase.co/storage/v1/object/public/vistrike-results/results/job-abc/annotated.mp4"
+}
+```
+
+- `summary` is always present (inline dict).
+- `summary_url`, `analysis_url`, `video_url` are HTTPS URLs if Supabase is
+  configured; `null` otherwise.
+- `video_url` is `null` when `save_video` is `false`.
+
+### Supabase Storage path convention
+
+```
+<bucket>/
+├── uploads/                    ← user videos (presigned PUT from browser)
+│   └── <filename>.mp4
+└── results/
+    └── <job_id>/
+        ├── summary.json
+        ├── analysis.json
+        └── annotated.mp4       ← only when save_video=true
+```
+
+### Progress updates (during processing)
+
+The handler calls `runpod.serverless.progress_update()` at each stage.
+The Vercel proxy can read these from the RunPod `/status/{jobId}` response
+and forward to the browser progress UI.
+
+```json
+{ "message": "Analyzing video…", "percent": 10, "status": "analyzing" }
+```
+
+| `status` value | `percent` | Meaning |
+|----------------|-----------|---------|
+| `downloading` | 0 | Fetching source video |
+| `loading_model` | 5 | Loading PyTorch weights |
+| `analyzing` | 10 | Running frame-by-frame inference |
+| `computing_summary` | 80 | Aggregating events into summary |
+| `creating_video` | 85 | Rendering annotated MP4 |
+| `uploading_results` | 92 | Pushing JSON to Supabase |
+| `uploading_video` | 96 | Pushing annotated MP4 to Supabase |
+| `completed` | 100 | Job finished |

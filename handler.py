@@ -2,9 +2,16 @@
 RunPod Serverless handler for VISTRIKE video inference.
 
 Receives a job with a video URL + params, runs inference, uploads results
-to S3-compatible storage, returns URLs.
+to Supabase Storage, returns summary + artifact URLs.
 
-RunPod sends jobs as: {"id": "...", "input": {...}, "s3Config": {...}}
+Environment variables (set in RunPod dashboard → endpoint → secrets):
+  SUPABASE_URL              – e.g. https://xxxx.supabase.co
+  SUPABASE_SERVICE_ROLE_KEY – service-role key (NOT the anon key)
+  SUPABASE_BUCKET           – storage bucket name, e.g. "vistrike-results"
+  DEVICE                    – "cuda" (default) or "cpu"
+  DEFAULT_CONFIDENCE        – detection threshold (default 0.5)
+  DEFAULT_ATTR_CONFIDENCE   – attribute threshold (default 0.0)
+  DEFAULT_ACTION_CONFIDENCE – action event threshold (default 0.6)
 """
 
 import os
@@ -15,6 +22,7 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
+import requests
 import runpod
 
 PROJECT_ROOT = Path("/app")
@@ -23,7 +31,63 @@ os.chdir(str(PROJECT_ROOT))
 
 from utils.batch_video_analyzer import BoxingAnalyzer, compute_summary, save_json
 
+# ---------------------------------------------------------------------------
+# Supabase Storage helpers
+# ---------------------------------------------------------------------------
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "vistrike-results")
+
+
+def _supabase_headers(content_type: str = "application/octet-stream") -> dict:
+    return {
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "apikey": SUPABASE_KEY,
+        "Content-Type": content_type,
+    }
+
+
+def supabase_upload(filepath: Path, object_path: str) -> str:
+    """Upload a file to Supabase Storage. Returns the public HTTPS URL."""
+    content_type = "application/json"
+    if filepath.suffix == ".mp4":
+        content_type = "video/mp4"
+
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{object_path}"
+    with open(filepath, "rb") as f:
+        resp = requests.post(
+            url,
+            headers=_supabase_headers(content_type),
+            data=f,
+            timeout=300,
+        )
+
+    if resp.status_code == 400 and "Duplicate" in resp.text:
+        resp = requests.put(
+            url,
+            headers=_supabase_headers(content_type),
+            data=open(filepath, "rb"),
+            timeout=300,
+        )
+
+    resp.raise_for_status()
+    public_url = (
+        f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{object_path}"
+    )
+    return public_url
+
+
+def _supabase_configured() -> bool:
+    return bool(SUPABASE_URL and SUPABASE_KEY)
+
+
+# ---------------------------------------------------------------------------
+# Model singleton
+# ---------------------------------------------------------------------------
+
 MODEL = None
+
 
 def load_model():
     global MODEL
@@ -41,6 +105,11 @@ def load_model():
     return MODEL
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
 def download_video(url: str, dest: Path):
     print(f"Downloading video from {url}")
     urllib.request.urlretrieve(url, str(dest))
@@ -48,35 +117,27 @@ def download_video(url: str, dest: Path):
     print(f"Downloaded {size_mb:.1f} MB")
 
 
-def upload_file(filepath: Path, s3_config: dict, key: str):
-    """Upload a file to S3-compatible storage. Returns the public/presigned URL."""
-    import boto3
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=s3_config.get("endpointUrl"),
-        aws_access_key_id=s3_config["accessId"],
-        aws_secret_access_key=s3_config["accessSecret"],
+def _progress(job, message: str, percent: int, status: str = "processing"):
+    """Send a progress update the Vercel proxy can forward to the browser."""
+    runpod.serverless.progress_update(
+        job, {"message": message, "percent": percent, "status": status}
     )
-    bucket = s3_config["bucketName"]
-    content_type = "application/json"
-    if key.endswith(".mp4"):
-        content_type = "video/mp4"
-    s3.upload_file(
-        str(filepath), bucket, key,
-        ExtraArgs={"ContentType": content_type},
-    )
-    url = f"{s3_config['endpointUrl']}/{bucket}/{key}"
-    return url
+
+
+# ---------------------------------------------------------------------------
+# Handler
+# ---------------------------------------------------------------------------
 
 
 def handler(job):
     job_input = job["input"]
-    s3_config = job.get("s3Config")
 
+    # --- Required input -------------------------------------------------------
     video_url = job_input.get("video_url")
     if not video_url:
         return {"error": "Missing video_url in input"}
 
+    # --- Optional inputs (cloud GPU — ignore device from client) --------------
     confidence = float(job_input.get("confidence", 0.5))
     attr_confidence = float(job_input.get("attr_confidence", 0.0))
     action_confidence = float(job_input.get("action_confidence", 0.6))
@@ -84,7 +145,7 @@ def handler(job):
     if isinstance(save_video, str):
         save_video = save_video.lower() in ("true", "1", "yes")
 
-    runpod.serverless.progress_update(job, {"status": "downloading", "percent": 0})
+    _progress(job, "Downloading video…", 0, "downloading")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
@@ -94,19 +155,19 @@ def handler(job):
 
         download_video(video_url, video_path)
 
-        runpod.serverless.progress_update(job, {"status": "loading_model", "percent": 5})
+        _progress(job, "Loading model…", 5, "loading_model")
         analyzer = load_model()
         analyzer.confidence = confidence
         analyzer.attr_confidence = attr_confidence
         analyzer.action_confidence = action_confidence
 
-        runpod.serverless.progress_update(job, {"status": "analyzing", "percent": 10})
+        _progress(job, "Analyzing video…", 10, "analyzing")
 
         start = time.time()
         results = analyzer.analyze_video(str(video_path))
         elapsed = time.time() - start
 
-        runpod.serverless.progress_update(job, {"status": "computing_summary", "percent": 80})
+        _progress(job, "Computing summary…", 80, "computing_summary")
 
         summary = compute_summary(
             results,
@@ -120,40 +181,48 @@ def handler(job):
         save_json(results, analysis_path)
         save_json(summary, summary_path)
 
-        video_url_out = None
+        annotated_path = None
         if save_video:
-            runpod.serverless.progress_update(job, {"status": "creating_video", "percent": 85})
+            _progress(job, "Creating annotated video…", 85, "creating_video")
             annotated_path = output_dir / f"{video_path.stem}_annotated.mp4"
-            analyzer.create_annotated_video(str(video_path), results, str(annotated_path))
+            analyzer.create_annotated_video(
+                str(video_path), results, str(annotated_path)
+            )
 
-        runpod.serverless.progress_update(job, {"status": "uploading_results", "percent": 95})
-
+        # --- Upload to Supabase ------------------------------------------------
         job_id = job["id"]
+        summary_url = None
+        analysis_url = None
+        video_url_out = None
 
-        if s3_config:
+        if _supabase_configured():
+            _progress(job, "Uploading results…", 92, "uploading_results")
             prefix = f"results/{job_id}"
-            summary_url = upload_file(summary_path, s3_config, f"{prefix}/summary.json")
-            analysis_url = upload_file(analysis_path, s3_config, f"{prefix}/analysis.json")
-            if save_video and annotated_path.exists():
-                video_url_out = upload_file(annotated_path, s3_config, f"{prefix}/annotated.mp4")
-
-            return {
-                "status": "completed",
-                "elapsed_seconds": round(elapsed, 1),
-                "total_frames": results.get("total_frames", 0),
-                "summary_url": summary_url,
-                "analysis_url": analysis_url,
-                "video_url": video_url_out,
-                "summary": summary,
-            }
+            summary_url = supabase_upload(summary_path, f"{prefix}/summary.json")
+            analysis_url = supabase_upload(analysis_path, f"{prefix}/analysis.json")
+            if save_video and annotated_path and annotated_path.exists():
+                _progress(job, "Uploading annotated video…", 96, "uploading_video")
+                video_url_out = supabase_upload(
+                    annotated_path, f"{prefix}/annotated.mp4"
+                )
         else:
-            return {
-                "status": "completed",
-                "elapsed_seconds": round(elapsed, 1),
-                "total_frames": results.get("total_frames", 0),
-                "summary": summary,
-            }
+            print("WARNING: Supabase not configured — skipping upload")
+
+        _progress(job, "Done", 100, "completed")
+
+        return {
+            "status": "completed",
+            "elapsed_seconds": round(elapsed, 1),
+            "total_frames": results.get("total_frames", 0),
+            "summary": summary,
+            "summary_url": summary_url,
+            "analysis_url": analysis_url,
+            "video_url": video_url_out,
+        }
 
 
+# ---------------------------------------------------------------------------
+# Entrypoint — load model at container start (warm worker), then serve jobs
+# ---------------------------------------------------------------------------
 load_model()
 runpod.serverless.start({"handler": handler})
