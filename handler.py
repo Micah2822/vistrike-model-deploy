@@ -106,17 +106,66 @@ def _unified_checkpoint_present(models_root: Path) -> bool:
     return False
 
 
+def _diagnose_paths():
+    """Print diagnostic info about model directories so volume issues are obvious."""
+    vol_root = Path("/runpod-volume")
+    vol_models = vol_root / "models"
+    app_models = PROJECT_ROOT / "models"
+
+    print("--- Model path diagnostics ---")
+    print(f"  /runpod-volume exists: {vol_root.exists()}")
+    if vol_root.exists():
+        try:
+            contents = list(vol_root.iterdir())
+            print(f"  /runpod-volume contents: {[p.name for p in contents]}")
+        except PermissionError:
+            print("  /runpod-volume: permission denied listing contents")
+
+    print(f"  /runpod-volume/models exists: {vol_models.exists()}")
+    if vol_models.exists():
+        try:
+            contents = list(vol_models.iterdir())
+            print(f"  /runpod-volume/models contents: {[p.name for p in contents]}")
+            unified = vol_models / "unified"
+            if unified.exists():
+                u_contents = list(unified.iterdir())
+                print(f"  /runpod-volume/models/unified contents: {[p.name for p in u_contents]}")
+        except PermissionError:
+            print("  /runpod-volume/models: permission denied listing contents")
+
+    print(f"  /app/models exists: {app_models.exists()}")
+    if app_models.exists():
+        try:
+            contents = list(app_models.iterdir())
+            print(f"  /app/models contents: {[p.name for p in contents]}")
+        except Exception:
+            pass
+    print("--- End diagnostics ---")
+
+
 def _resolve_models_dir() -> str:
     """Pick weights directory: MODELS_DIR env, else baked /app/models, else volume."""
     override = os.environ.get("MODELS_DIR", "").strip()
     if override:
+        print(f"MODELS_DIR override set: {override}")
         return override
+
     app_models = PROJECT_ROOT / "models"
     vol_models = Path("/runpod-volume/models")
+
     if _unified_checkpoint_present(app_models):
+        print("Found unified checkpoint in /app/models (baked into image)")
         return str(app_models)
     if _unified_checkpoint_present(vol_models):
+        print("Found unified checkpoint in /runpod-volume/models (network volume)")
         return str(vol_models)
+
+    _diagnose_paths()
+    print(
+        "WARNING: No unified checkpoint found in /app/models or /runpod-volume/models. "
+        "Is the network volume attached to this endpoint? "
+        "(Serverless → endpoint → Edit → Advanced → Network Volumes)"
+    )
     return str(app_models)
 
 
