@@ -13,11 +13,15 @@ Environment variables (set in RunPod dashboard → endpoint → secrets):
   DEFAULT_CONFIDENCE        – detection threshold (default 0.5)
   DEFAULT_ATTR_CONFIDENCE   – attribute threshold (default 0.0)
   DEFAULT_ACTION_CONFIDENCE – action event threshold (default 0.6)
+  USE_GAP_GROUPING          – "true" to use gap-based event grouping (default "true").
+                            Gap grouping replaces peak detection for non-defense
+                            action types and generally produces more accurate counts.
   MODELS_DIR                – optional override for weights directory. If unset,
                             uses /app/models when it contains a unified checkpoint,
                             else /runpod-volume/models (RunPod network volume).
 """
 
+import io
 import os
 import sys
 import json
@@ -72,7 +76,7 @@ def supabase_upload(filepath: Path, object_path: str) -> str:
         resp = requests.put(
             url,
             headers=_supabase_headers(content_type),
-            data=open(filepath, "rb"),
+            data=open(filepath, "rb").read(),
             timeout=300,
         )
 
@@ -183,6 +187,7 @@ def load_model():
         confidence=float(os.environ.get("DEFAULT_CONFIDENCE", "0.5")),
         attr_confidence=float(os.environ.get("DEFAULT_ATTR_CONFIDENCE", "0.0")),
         action_confidence=float(os.environ.get("DEFAULT_ACTION_CONFIDENCE", "0.6")),
+        use_gap_grouping=os.environ.get("USE_GAP_GROUPING", "true").lower() in ("true", "1", "yes"),
         backend="onnx",
     )
     return MODEL
@@ -200,11 +205,35 @@ def download_video(url: str, dest: Path):
     print(f"Downloaded {size_mb:.1f} MB")
 
 
-def _progress(job, message: str, percent: int, status: str = "processing"):
+class _TeeStream:
+    """Write to both the original stream and a StringIO buffer."""
+
+    def __init__(self, original, buffer):
+        self._original = original
+        self._buffer = buffer
+
+    def write(self, data):
+        self._original.write(data)
+        try:
+            self._buffer.write(data)
+        except Exception:
+            pass
+        return len(data)
+
+    def flush(self):
+        self._original.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
+
+def _progress(job, message: str, percent: int, status: str = "processing",
+              log_buffer=None):
     """Send a progress update the Vercel proxy can forward to the browser."""
-    runpod.serverless.progress_update(
-        job, {"message": message, "percent": percent, "status": status}
-    )
+    payload = {"message": message, "percent": percent, "status": status}
+    if log_buffer is not None:
+        payload["logs"] = log_buffer.getvalue()[-50_000:]
+    runpod.serverless.progress_update(job, payload)
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +242,7 @@ def _progress(job, message: str, percent: int, status: str = "processing"):
 
 
 def handler(job):
-    job_input = job["input"]
+    job_input = job.get("input") or {}
 
     # --- Required input -------------------------------------------------------
     video_url = job_input.get("video_url")
@@ -228,80 +257,124 @@ def handler(job):
     if isinstance(save_video, str):
         save_video = save_video.lower() in ("true", "1", "yes")
 
-    _progress(job, "Downloading video…", 0, "downloading")
+    # --- Tee stdout/stderr into an in-memory buffer for live log streaming ----
+    log_buffer = io.StringIO()
+    _orig_stdout, _orig_stderr = sys.stdout, sys.stderr
+    try:
+        sys.stdout = _TeeStream(_orig_stdout, log_buffer)
+        sys.stderr = _TeeStream(_orig_stderr, log_buffer)
+    except Exception:
+        pass  # fall back to normal streams if tee setup fails
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        video_path = tmpdir / "input_video.mp4"
-        output_dir = tmpdir / "output"
-        output_dir.mkdir()
+    try:
+        _progress(job, "Downloading video…", 0, "downloading", log_buffer)
 
-        download_video(video_url, video_path)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            video_path = tmpdir / "input_video.mp4"
+            output_dir = tmpdir / "output"
+            output_dir.mkdir()
 
-        _progress(job, "Loading model…", 5, "loading_model")
-        analyzer = load_model()
-        analyzer.confidence = confidence
-        analyzer.attr_confidence = attr_confidence
-        analyzer.action_confidence = action_confidence
+            download_video(video_url, video_path)
 
-        _progress(job, "Analyzing video…", 10, "analyzing")
+            _progress(job, "Loading model…", 5, "loading_model", log_buffer)
+            analyzer = load_model()
+            analyzer.confidence = confidence
+            analyzer.attr_confidence = attr_confidence
+            analyzer.action_confidence = action_confidence
 
-        start = time.time()
-        results = analyzer.analyze_video(str(video_path))
-        elapsed = time.time() - start
+            _progress(job, "Analyzing video…", 10, "analyzing", log_buffer)
 
-        _progress(job, "Computing summary…", 80, "computing_summary")
+            _last_progress_time = 0
 
-        summary = compute_summary(
-            results,
-            action_confidence=action_confidence,
-            min_separation=3,
-            gap_threshold=analyzer.get_gap_threshold(),
-        )
+            def on_frame_progress(current_frame, total_frames, **kwargs):
+                nonlocal _last_progress_time
+                now = time.time()
+                is_last = current_frame >= total_frames - 1
+                if not is_last and (now - _last_progress_time) < 0.5 and current_frame % 5 != 0:
+                    return
+                _last_progress_time = now
+                pct = 10 + int((current_frame / max(total_frames, 1)) * 70)
+                runpod.serverless.progress_update(job, {
+                    "message": f"Analyzing frame {current_frame}/{total_frames}…",
+                    "percent": pct,
+                    "status": "analyzing",
+                    "current_frame": current_frame,
+                    "total_frames": total_frames,
+                    "fps": kwargs.get("fps", 0),
+                    "boxes_detected": kwargs.get("boxes_detected", 0),
+                    "avg_confidence": kwargs.get("avg_confidence", 0),
+                    "video_resolution": kwargs.get("video_resolution", ""),
+                    "video_fps": kwargs.get("video_fps", 0),
+                    "logs": log_buffer.getvalue()[-50_000:],
+                })
 
-        analysis_path = output_dir / "analysis.json"
-        summary_path = output_dir / "summary.json"
-        save_json(results, analysis_path)
-        save_json(summary, summary_path)
+            start = time.time()
+            results = analyzer.analyze_video(
+                str(video_path), progress_callback=on_frame_progress
+            )
+            elapsed = time.time() - start
 
-        annotated_path = None
-        if save_video:
-            _progress(job, "Creating annotated video…", 85, "creating_video")
-            annotated_path = output_dir / f"{video_path.stem}_annotated.mp4"
-            analyzer.create_annotated_video(
-                str(video_path), results, str(annotated_path)
+            _progress(job, "Computing summary…", 80, "computing_summary", log_buffer)
+
+            summary = compute_summary(
+                results,
+                action_confidence=action_confidence,
+                min_separation=3,
+                gap_threshold=analyzer.get_gap_threshold(),
             )
 
-        # --- Upload to Supabase ------------------------------------------------
-        job_id = job["id"]
-        summary_url = None
-        analysis_url = None
-        video_url_out = None
+            analysis_path = output_dir / "analysis.json"
+            summary_path = output_dir / "summary.json"
+            save_json(results, analysis_path)
+            save_json(summary, summary_path)
 
-        if _supabase_configured():
-            _progress(job, "Uploading results…", 92, "uploading_results")
-            prefix = f"results/{job_id}"
-            summary_url = supabase_upload(summary_path, f"{prefix}/summary.json")
-            analysis_url = supabase_upload(analysis_path, f"{prefix}/analysis.json")
-            if save_video and annotated_path and annotated_path.exists():
-                _progress(job, "Uploading annotated video…", 96, "uploading_video")
-                video_url_out = supabase_upload(
-                    annotated_path, f"{prefix}/annotated.mp4"
+            annotated_path = None
+            if save_video:
+                _progress(job, "Creating annotated video…", 85, "creating_video",
+                          log_buffer)
+                annotated_path = output_dir / f"{video_path.stem}_annotated.mp4"
+                analyzer.create_annotated_video(
+                    str(video_path), results, str(annotated_path)
                 )
-        else:
-            print("WARNING: Supabase not configured — skipping upload")
 
-        _progress(job, "Done", 100, "completed")
+            # --- Upload to Supabase --------------------------------------------
+            job_id = job["id"]
+            summary_url = None
+            analysis_url = None
+            video_url_out = None
 
-        return {
-            "status": "completed",
-            "elapsed_seconds": round(elapsed, 1),
-            "total_frames": results.get("total_frames", 0),
-            "summary": summary,
-            "summary_url": summary_url,
-            "analysis_url": analysis_url,
-            "video_url": video_url_out,
-        }
+            if _supabase_configured():
+                _progress(job, "Uploading results…", 92, "uploading_results",
+                          log_buffer)
+                prefix = f"results/{job_id}"
+                summary_url = supabase_upload(summary_path,
+                                              f"{prefix}/summary.json")
+                analysis_url = supabase_upload(analysis_path,
+                                               f"{prefix}/analysis.json")
+                if save_video and annotated_path and annotated_path.exists():
+                    _progress(job, "Uploading annotated video…", 96,
+                              "uploading_video", log_buffer)
+                    video_url_out = supabase_upload(
+                        annotated_path, f"{prefix}/annotated.mp4"
+                    )
+            else:
+                print("WARNING: Supabase not configured — skipping upload")
+
+            _progress(job, "Done", 100, "completed", log_buffer)
+
+            return {
+                "status": "completed",
+                "elapsed_seconds": round(elapsed, 1),
+                "total_frames": results.get("total_frames", 0),
+                "summary": summary,
+                "summary_url": summary_url,
+                "analysis_url": analysis_url,
+                "video_url": video_url_out,
+            }
+    finally:
+        sys.stdout = _orig_stdout
+        sys.stderr = _orig_stderr
 
 
 # ---------------------------------------------------------------------------

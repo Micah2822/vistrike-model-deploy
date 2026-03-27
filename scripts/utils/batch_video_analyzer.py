@@ -1371,6 +1371,7 @@ class BoxingAnalyzer:
         self,
         video_path: str,
         progress: bool = True,
+        progress_callback=None,
     ) -> Dict:
         """
         Analyze entire video.
@@ -1378,6 +1379,8 @@ class BoxingAnalyzer:
         Args:
             video_path: Path to video file
             progress: Show progress bar
+            progress_callback: Optional callable(current_frame, total_frames, **kw)
+                invoked every few frames with live stats for remote progress reporting.
             
         Returns:
             Dict with video metadata and frame-by-frame analysis
@@ -1424,6 +1427,7 @@ class BoxingAnalyzer:
         
         # Process frames
         frame_idx = 0
+        _pc_t0 = time.time()
         iterator = range(total_frames)
         if progress:
             iterator = tqdm(iterator, desc="Analyzing frames")
@@ -1447,6 +1451,22 @@ class BoxingAnalyzer:
             
             if progress:
                 iterator.update(1) if hasattr(iterator, 'update') else None
+            
+            if progress_callback and frame_idx % 5 == 0:
+                boxes = len(frame_result.get('persons', []))
+                confs = [
+                    p['confidence'] for p in frame_result.get('persons', [])
+                    if 'confidence' in p
+                ]
+                progress_callback(
+                    current_frame=frame_idx,
+                    total_frames=total_frames,
+                    fps=frame_idx / max(time.time() - _pc_t0, 1e-6),
+                    boxes_detected=boxes,
+                    avg_confidence=sum(confs) / len(confs) if confs else 0.0,
+                    video_resolution=f"{width}x{height}",
+                    video_fps=fps,
+                )
         
         cap.release()
         

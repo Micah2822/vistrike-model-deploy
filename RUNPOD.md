@@ -100,6 +100,7 @@ In the endpoint **Environment** section, add every variable below.
 | `DEFAULT_CONFIDENCE` | Detection threshold (overridden per-job if client sends `confidence`) | `0.5` |
 | `DEFAULT_ATTR_CONFIDENCE` | Attribute threshold | `0.0` |
 | `DEFAULT_ACTION_CONFIDENCE` | Action event threshold | `0.6` |
+| `USE_GAP_GROUPING` | `true` / `false` — gap-based event grouping for non-defense actions. More accurate than peak detection; set `false` to revert to peak detection. | `true` |
 
 ---
 
