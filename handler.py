@@ -230,7 +230,14 @@ class _TeeStream:
 def _progress(job, message: str, percent: int, status: str = "processing",
               log_buffer=None):
     """Send a progress update the Vercel proxy can forward to the browser."""
-    payload = {"message": message, "percent": percent, "status": status}
+    payload = {
+        "message": message,
+        "percent": percent,
+        "status": status,
+        "score_range": "unknown",
+        "detection_threshold": "unknown",
+        "boxes_above_threshold": "unknown",
+    }
     if log_buffer is not None:
         payload["logs"] = log_buffer.getvalue()[-50_000:]
     runpod.serverless.progress_update(job, payload)
@@ -306,6 +313,9 @@ def handler(job):
                     "avg_confidence": kwargs.get("avg_confidence", 0),
                     "video_resolution": kwargs.get("video_resolution", ""),
                     "video_fps": kwargs.get("video_fps", 0),
+                    "score_range": kwargs.get("score_range", "unknown"),
+                    "detection_threshold": kwargs.get("detection_threshold", "unknown"),
+                    "boxes_above_threshold": kwargs.get("boxes_above_threshold", "unknown"),
                     "logs": log_buffer.getvalue()[-50_000:],
                 })
 
