@@ -381,8 +381,7 @@ def handler(job):
             else:
                 print("WARNING: Supabase not configured — skipping upload")
 
-            _progress(job, "Done", 100, "completed", log_buffer)
-
+            print("FINAL_RETURN: sending completed payload")
             return {
                 "status": "completed",
                 "elapsed_seconds": round(elapsed, 1),
