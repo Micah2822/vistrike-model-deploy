@@ -1,8 +1,9 @@
 """
-RunPod Serverless handler for VISTRIKE video inference.
+RunPod Serverless handler for VISTRIKE video inference (ONNX Runtime).
 
-Receives a job with a video URL + params, runs inference, uploads results
-to Supabase Storage, returns summary + artifact URLs.
+Receives a job with a video URL + params, runs ONNX inference via
+inference_onnx pipeline, uploads results to Supabase Storage, returns
+summary + artifact URLs.
 
 Environment variables (set in RunPod dashboard → endpoint → secrets):
   SUPABASE_URL              – e.g. https://xxxx.supabase.co
@@ -33,6 +34,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 os.chdir(str(PROJECT_ROOT))
 
 from utils.batch_video_analyzer import BoxingAnalyzer, compute_summary, save_json
+from inference_onnx import _check_onnx_artifacts
 
 # ---------------------------------------------------------------------------
 # Supabase Storage helpers
@@ -125,13 +127,14 @@ def load_model():
     device = "cuda" if os.environ.get("DEVICE", "cuda") != "cpu" else "cpu"
     models_dir = _resolve_models_dir()
     print(f"Using models_dir={models_dir}")
+    _check_onnx_artifacts(Path(models_dir))
     MODEL = BoxingAnalyzer(
         models_dir=models_dir,
         device=device,
         confidence=float(os.environ.get("DEFAULT_CONFIDENCE", "0.5")),
         attr_confidence=float(os.environ.get("DEFAULT_ATTR_CONFIDENCE", "0.0")),
         action_confidence=float(os.environ.get("DEFAULT_ACTION_CONFIDENCE", "0.6")),
-        backend="pytorch",
+        backend="onnx",
     )
     return MODEL
 
