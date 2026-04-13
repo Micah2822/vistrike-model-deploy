@@ -49,19 +49,16 @@ from inference_onnx import _check_onnx_artifacts
 # Supabase Storage helpers
 # ---------------------------------------------------------------------------
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "vistrike-results")
 
 
 def _supabase_headers(content_type: str = "application/octet-stream") -> dict:
-    # x-upsert allows overwriting an existing object on POST so retries and
-    # replayed job ids don't fail with 400 "Asset Already Exists".
     return {
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "apikey": SUPABASE_KEY,
         "Content-Type": content_type,
-        "x-upsert": "true",
     }
 
 
@@ -72,22 +69,20 @@ def supabase_upload(filepath: Path, object_path: str) -> str:
         content_type = "video/mp4"
 
     url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{object_path}"
-    size = filepath.stat().st_size
-    headers = _supabase_headers(content_type)
-    headers["Content-Length"] = str(size)
-
     with open(filepath, "rb") as f:
-        resp = requests.post(url, headers=headers, data=f, timeout=300)
+        resp = requests.post(
+            url,
+            headers=_supabase_headers(content_type),
+            data=f,
+            timeout=300,
+        )
 
-    if not resp.ok:
-        print(
-            "Supabase upload failed:",
-            {
-                "object_path": object_path,
-                "status": resp.status_code,
-                "body": (resp.text or "")[:4000],
-                "file_bytes": size,
-            },
+    if resp.status_code == 400 and "Duplicate" in resp.text:
+        resp = requests.put(
+            url,
+            headers=_supabase_headers(content_type),
+            data=open(filepath, "rb").read(),
+            timeout=300,
         )
 
     resp.raise_for_status()
