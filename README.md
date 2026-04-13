@@ -220,7 +220,14 @@ The Vercel proxy can read these from the RunPod `/status/{jobId}` response
 and forward to the browser progress UI.
 
 ```json
-{ "message": "Analyzing video…", "percent": 10, "status": "analyzing" }
+{
+  "message": "Analyzing video…",
+  "percent": 10,
+  "status": "analyzing",
+  "score_range": "0.5021-0.9416",
+  "detection_threshold": 0.5,
+  "boxes_above_threshold": 2
+}
 ```
 
 | `status` value | `percent` | Meaning |
@@ -232,4 +239,8 @@ and forward to the browser progress UI.
 | `creating_video` | 85 | Rendering annotated MP4 |
 | `uploading_results` | 92 | Pushing JSON to Supabase |
 | `uploading_video` | 96 | Pushing annotated MP4 to Supabase |
-| `completed` | 100 | Job finished |
+
+Notes:
+- `score_range`, `detection_threshold`, and `boxes_above_threshold` are always present in progress payloads.
+- When stats are not available yet, those fields are the explicit string `"unknown"`.
+- Job completion is indicated by the final handler return payload (`status: "completed"`), not a final `progress_update`.

@@ -9,6 +9,9 @@ identical for both backends; only model forward passes differ (PyTorch vs ORT).
 
 Entry-point scripts call run_main(args, backend=...). See also
 scripts/utils/ort_video_backend.py and scripts/utils/onnx_model_metadata.py.
+
+When analyze_video() is called with progress_callback, callback kwargs include
+score_range, detection_threshold, and boxes_above_threshold for live status UIs.
 """
 
 
