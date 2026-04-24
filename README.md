@@ -111,8 +111,11 @@ docker build -t yourdockerhub/vistrike-worker:latest .
 
 ```bash
 # Requires GPU + models present in models/
+# Inference defaults (device, thresholds, grouping, etc.) come from
+# configs/inference.yaml, which is baked into the image. To try alternative
+# defaults without rebuilding, mount a replacement file and point
+# INFERENCE_CONFIG_PATH at it.
 docker run --rm --gpus all \
-  -e DEVICE=cuda \
   -v $(pwd)/models:/app/models \
   yourdockerhub/vistrike-worker:latest \
   python -u /app/handler.py --test_input '{

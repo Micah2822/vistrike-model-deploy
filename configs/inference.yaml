@@ -1,0 +1,62 @@
+# =============================================================================
+# VISTRIKE Inference Defaults (serverless RunPod handler)
+# =============================================================================
+# Single source of truth for inference-time configuration used by handler.py.
+# Replaces the former RunPod env vars: DEVICE, DEFAULT_CONFIDENCE,
+# DEFAULT_ATTR_CONFIDENCE, DEFAULT_ACTION_CONFIDENCE, USE_GAP_GROUPING,
+# MODELS_DIR.
+#
+# Precedence at runtime: job["input"] overrides this file. Only the keys in
+# the override whitelist below participate in the merge; every other key is
+# considered config-only and requires editing this file (and rebuilding the
+# image, or mounting a new file) to change.
+#
+# Per-job override whitelist (keys accepted from job["input"]):
+#   - confidence
+#   - attr_confidence
+#   - action_confidence
+#   - save_video
+#   - min_separation
+#
+# Config-only keys (changing them requires worker restart):
+#   device, models_dir, use_gap_grouping, assign_single_fighter,
+#   side_confidence_min, stable_side_frames
+#
+# Supabase credentials and other secrets remain RunPod environment variables
+# (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_BUCKET). This file only
+# governs inference behaviour.
+#
+# The handler reads this file from INFERENCE_CONFIG_PATH if set, otherwise
+# /app/configs/inference.yaml.
+# =============================================================================
+
+# Execution device for the ONNX backend. "cuda" or "cpu".
+device: cuda
+
+# Weights directory. Leave empty/null to use the handler's auto-discovery
+# (prefers /app/models when a unified checkpoint is baked in, else falls back
+# to /runpod-volume/models). Set to an explicit path to force a location.
+models_dir: ""
+
+# Detection thresholds passed to BoxingAnalyzer at startup. Per-job input may
+# override confidence, attr_confidence, and action_confidence.
+confidence: 0.5
+attr_confidence: 0.0
+action_confidence: 0.6
+
+# Gap-based event grouping replaces peak detection for non-defense actions
+# and generally produces more accurate counts.
+use_gap_grouping: true
+
+# Minimum frames between successive events for the same fighter. Used both as
+# BoxingAnalyzer.min_event_separation and compute_summary(min_separation=...).
+min_separation: 3
+
+# Side-based fighter assignment knobs (see BoxingAnalyzer docstring).
+assign_single_fighter: false
+side_confidence_min: 0.0
+stable_side_frames: 0
+
+# Whether to render and upload an annotated video by default. Per-job input
+# may override this.
+save_video: true

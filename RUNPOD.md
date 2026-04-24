@@ -94,13 +94,27 @@ In the endpoint **Environment** section, add every variable below.
 
 ### Inference defaults
 
+All inference knobs (device, thresholds, gap grouping, side-assignment, `models_dir`) live in **[`configs/inference.yaml`](./configs/inference.yaml)**, which is baked into the image via `COPY configs/`. Edit the file and rebuild the image to change defaults. Per-job values in `job["input"]` override the YAML for these keys only: `confidence`, `attr_confidence`, `action_confidence`, `save_video`, `min_separation`. All other YAML keys are config-only — changing them requires a new image or a mounted replacement file plus a worker restart.
+
+Key fields in `configs/inference.yaml`:
+
+| YAML key | Purpose | Default |
+|----------|---------|---------|
+| `device` | `cuda` or `cpu` | `cuda` |
+| `models_dir` | Fixed weights directory. Empty/null uses auto-discovery (`/app/models` → `/runpod-volume/models`). | `""` |
+| `confidence` | Detection threshold (per-job override allowed) | `0.5` |
+| `attr_confidence` | Attribute threshold (per-job override allowed) | `0.0` |
+| `action_confidence` | Action event threshold (per-job override allowed) | `0.6` |
+| `use_gap_grouping` | Gap-based event grouping for non-defense actions. More accurate than peak detection; set `false` to revert. | `true` |
+| `min_separation` | Minimum frames between events from the same fighter (per-job override allowed) | `3` |
+| `assign_single_fighter`, `side_confidence_min`, `stable_side_frames` | Side-based fighter assignment | see YAML |
+| `save_video` | Whether to render and upload an annotated video by default (per-job override allowed) | `true` |
+
+Optional env var:
+
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `DEVICE` | `cuda` or `cpu` | `cuda` |
-| `DEFAULT_CONFIDENCE` | Detection threshold (overridden per-job if client sends `confidence`) | `0.5` |
-| `DEFAULT_ATTR_CONFIDENCE` | Attribute threshold | `0.0` |
-| `DEFAULT_ACTION_CONFIDENCE` | Action event threshold | `0.6` |
-| `USE_GAP_GROUPING` | `true` / `false` — gap-based event grouping for non-defense actions. More accurate than peak detection; set `false` to revert to peak detection. | `true` |
+| `INFERENCE_CONFIG_PATH` | Absolute path to the inference YAML. Use this to point at a mounted file instead of the baked-in copy. | `/app/configs/inference.yaml` |
 
 ---
 
@@ -210,14 +224,14 @@ Test with your **longest / highest-resolution clip** to find the right tier.
 
 ## Getting models into the worker
 
-The handler picks a weights directory automatically: **`MODELS_DIR`** env if set; otherwise **`/app/models`** when it contains **`unified/best.pt`** (or **`last.pt`** / **`unified_mps/…`**); otherwise **`/runpod-volume/models`** when that path has a unified checkpoint (RunPod attaches network volumes at **`/runpod-volume`**). Upload with S3 using prefix **`models/…`** so files land under **`/runpod-volume/models`**.
+The handler picks a weights directory automatically: the `models_dir` value in **[`configs/inference.yaml`](./configs/inference.yaml)** if set; otherwise **`/app/models`** when it contains **`unified/best.pt`** (or **`last.pt`** / **`unified_mps/…`**); otherwise **`/runpod-volume/models`** when that path has a unified checkpoint (RunPod attaches network volumes at **`/runpod-volume`**). Upload with S3 using prefix **`models/…`** so files land under **`/runpod-volume/models`**.
 
 | Strategy | How |
 |----------|-----|
 | **Bake into image** | Uncomment `COPY models/ /app/models/` in `Dockerfile`. Rebuild on weight changes. |
-| **Network volume** | Create volume → upload **`models/unified/best.pt`** via [S3 API](https://docs.runpod.io/storage/s3-api) (`aws s3 sync ./models s3://VOLUME_ID/models …`) → attach volume on the serverless endpoint (**Advanced → Network Volumes**). No env var required if the image has no conflicting weights under **`/app/models`**. |
-| **Download at startup** | Add a download step before `load_model()` into **`/app/models`** or set **`MODELS_DIR`**. Not implemented in-repo. |
-| **`MODELS_DIR` override** | Set on the endpoint if you store weights somewhere else entirely. |
+| **Network volume** | Create volume → upload **`models/unified/best.pt`** via [S3 API](https://docs.runpod.io/storage/s3-api) (`aws s3 sync ./models s3://VOLUME_ID/models …`) → attach volume on the serverless endpoint (**Advanced → Network Volumes**). Leave `models_dir` empty in the YAML and ensure the image has no conflicting weights under **`/app/models`**. |
+| **Download at startup** | Add a download step before `load_model()` into **`/app/models`** or set `models_dir` in the YAML to an explicit path. Not implemented in-repo. |
+| **`models_dir` override** | Set `models_dir` in `configs/inference.yaml` if you store weights somewhere else entirely. |
 
 ### Network volume: upload from your machine
 
@@ -345,7 +359,7 @@ Set **Idle timeout** higher (e.g. 120 s) to keep the worker warm between jobs.
 
 - Check worker logs for **`Using models_dir=…`**.
 - **Baked in:** `models/` on build machine and `COPY models/ /app/models/` uncommented.
-- **Volume:** S3 sync uses prefix **`s3://VOLUME_ID/models`** so **`unified/best.pt`** exists at **`/runpod-volume/models/unified/best.pt`**, and **`/app/models`** must not contain a stale **`unified/best.pt`** (otherwise baked path wins). Clear **`MODELS_DIR`** unless overriding.
+- **Volume:** S3 sync uses prefix **`s3://VOLUME_ID/models`** so **`unified/best.pt`** exists at **`/runpod-volume/models/unified/best.pt`**, and **`/app/models`** must not contain a stale **`unified/best.pt`** (otherwise baked path wins). Leave `models_dir` empty in `configs/inference.yaml` unless overriding.
 - Required: **`unified/best.pt`** or **`unified/last.pt`** (or **`unified_mps/…`**).
 
 ---

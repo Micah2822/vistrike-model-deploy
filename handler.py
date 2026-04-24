@@ -10,20 +10,20 @@ Progress payload contract:
   score_range, detection_threshold, and boxes_above_threshold.
   Unknown values are sent as the explicit string "unknown".
 
+Inference defaults:
+  All inference knobs (device, thresholds, grouping, models_dir, etc.) live
+  in configs/inference.yaml. Edit that file (and rebuild the image, or mount
+  a replacement) to change defaults. Per-job values in job["input"] override
+  the YAML for these keys only:
+    confidence, attr_confidence, action_confidence, save_video, min_separation
+  All other YAML keys are config-only and require a worker restart to apply.
+
 Environment variables (set in RunPod dashboard → endpoint → secrets):
   SUPABASE_URL              – e.g. https://xxxx.supabase.co
   SUPABASE_SERVICE_ROLE_KEY – service-role key (NOT the anon key)
   SUPABASE_BUCKET           – storage bucket name, e.g. "vistrike-results"
-  DEVICE                    – "cuda" (default) or "cpu"
-  DEFAULT_CONFIDENCE        – detection threshold (default 0.5)
-  DEFAULT_ATTR_CONFIDENCE   – attribute threshold (default 0.0)
-  DEFAULT_ACTION_CONFIDENCE – action event threshold (default 0.6)
-  USE_GAP_GROUPING          – "true" to use gap-based event grouping (default "true").
-                            Gap grouping replaces peak detection for non-defense
-                            action types and generally produces more accurate counts.
-  MODELS_DIR                – optional override for weights directory. If unset,
-                            uses /app/models when it contains a unified checkpoint,
-                            else /runpod-volume/models (RunPod network volume).
+  INFERENCE_CONFIG_PATH     – optional path to the inference YAML. Defaults
+                            to /app/configs/inference.yaml.
 """
 
 import io
@@ -37,6 +37,7 @@ from pathlib import Path
 
 import requests
 import runpod
+import yaml
 
 PROJECT_ROOT = Path("/app")
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
@@ -44,6 +45,75 @@ os.chdir(str(PROJECT_ROOT))
 
 from utils.batch_video_analyzer import BoxingAnalyzer, compute_summary, save_json
 from inference_onnx import _check_onnx_artifacts
+
+# ---------------------------------------------------------------------------
+# Inference configuration (YAML)
+# ---------------------------------------------------------------------------
+
+DEFAULT_INFERENCE_CONFIG_PATH = PROJECT_ROOT / "configs" / "inference.yaml"
+
+# Keys accepted from job["input"] as per-run overrides. Everything else in the
+# YAML is config-only and requires a worker restart to change.
+_INPUT_OVERRIDE_KEYS = (
+    "confidence",
+    "attr_confidence",
+    "action_confidence",
+    "save_video",
+    "min_separation",
+)
+
+
+def _load_inference_config() -> dict:
+    """Read configs/inference.yaml (or INFERENCE_CONFIG_PATH) once at import."""
+    override = os.environ.get("INFERENCE_CONFIG_PATH", "").strip()
+    path = Path(override) if override else DEFAULT_INFERENCE_CONFIG_PATH
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Inference config not found at {path}. Set INFERENCE_CONFIG_PATH "
+            f"or ensure configs/inference.yaml is present in the image."
+        )
+    try:
+        with open(path, "r") as f:
+            data = yaml.safe_load(f) or {}
+    except yaml.YAMLError as exc:
+        raise RuntimeError(f"Invalid YAML in inference config {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"Inference config at {path} must be a YAML mapping, got {type(data).__name__}"
+        )
+    print(f"Loaded inference config from {path}")
+    return data
+
+
+INFERENCE_DEFAULTS = _load_inference_config()
+
+
+def _coerce_bool(value, fallback: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ("true", "1", "yes")
+    if value is None:
+        return fallback
+    return bool(value)
+
+
+def _merge_inference(job_input: dict) -> dict:
+    """Overlay whitelisted job["input"] keys on top of INFERENCE_DEFAULTS."""
+    effective = dict(INFERENCE_DEFAULTS)
+    for key in _INPUT_OVERRIDE_KEYS:
+        if key not in job_input or job_input[key] is None:
+            continue
+        raw = job_input[key]
+        if key in ("confidence", "attr_confidence", "action_confidence"):
+            effective[key] = float(raw)
+        elif key == "min_separation":
+            effective[key] = int(raw)
+        elif key == "save_video":
+            effective[key] = _coerce_bool(raw, bool(effective.get(key, True)))
+        else:
+            effective[key] = raw
+    return effective
 
 # ---------------------------------------------------------------------------
 # Supabase Storage helpers
@@ -153,10 +223,10 @@ def _diagnose_paths():
 
 
 def _resolve_models_dir() -> str:
-    """Pick weights directory: MODELS_DIR env, else baked /app/models, else volume."""
-    override = os.environ.get("MODELS_DIR", "").strip()
+    """Pick weights directory: YAML models_dir, else baked /app/models, else volume."""
+    override = str(INFERENCE_DEFAULTS.get("models_dir") or "").strip()
     if override:
-        print(f"MODELS_DIR override set: {override}")
+        print(f"models_dir override from inference config: {override}")
         return override
 
     app_models = PROJECT_ROOT / "models"
@@ -182,17 +252,22 @@ def load_model():
     global MODEL
     if MODEL is not None:
         return MODEL
-    device = "cuda" if os.environ.get("DEVICE", "cuda") != "cpu" else "cpu"
+    cfg = INFERENCE_DEFAULTS
+    device = "cpu" if str(cfg.get("device", "cuda")).lower() == "cpu" else "cuda"
     models_dir = _resolve_models_dir()
     print(f"Using models_dir={models_dir}")
     _check_onnx_artifacts(Path(models_dir))
     MODEL = BoxingAnalyzer(
         models_dir=models_dir,
         device=device,
-        confidence=float(os.environ.get("DEFAULT_CONFIDENCE", "0.5")),
-        attr_confidence=float(os.environ.get("DEFAULT_ATTR_CONFIDENCE", "0.0")),
-        action_confidence=float(os.environ.get("DEFAULT_ACTION_CONFIDENCE", "0.6")),
-        use_gap_grouping=os.environ.get("USE_GAP_GROUPING", "true").lower() in ("true", "1", "yes"),
+        confidence=float(cfg.get("confidence", 0.5)),
+        attr_confidence=float(cfg.get("attr_confidence", 0.0)),
+        action_confidence=float(cfg.get("action_confidence", 0.6)),
+        min_event_separation=int(cfg.get("min_separation", 3)),
+        assign_single_fighter=_coerce_bool(cfg.get("assign_single_fighter"), False),
+        side_confidence_min=float(cfg.get("side_confidence_min", 0.0)),
+        stable_side_frames=int(cfg.get("stable_side_frames", 0)),
+        use_gap_grouping=_coerce_bool(cfg.get("use_gap_grouping"), True),
         backend="onnx",
     )
     return MODEL
@@ -261,13 +336,13 @@ def handler(job):
     if not video_url:
         return {"error": "Missing video_url in input"}
 
-    # --- Optional inputs (cloud GPU — ignore device from client) --------------
-    confidence = float(job_input.get("confidence", 0.5))
-    attr_confidence = float(job_input.get("attr_confidence", 0.0))
-    action_confidence = float(job_input.get("action_confidence", 0.6))
-    save_video = job_input.get("save_video", True)
-    if isinstance(save_video, str):
-        save_video = save_video.lower() in ("true", "1", "yes")
+    # --- Merge YAML defaults with per-job overrides ---------------------------
+    effective = _merge_inference(job_input)
+    confidence = float(effective["confidence"])
+    attr_confidence = float(effective["attr_confidence"])
+    action_confidence = float(effective["action_confidence"])
+    min_separation = int(effective["min_separation"])
+    save_video = _coerce_bool(effective.get("save_video"), True)
 
     # --- Tee stdout/stderr into an in-memory buffer for live log streaming ----
     log_buffer = io.StringIO()
@@ -294,6 +369,7 @@ def handler(job):
             analyzer.confidence = confidence
             analyzer.attr_confidence = attr_confidence
             analyzer.action_confidence = action_confidence
+            analyzer.min_event_separation = min_separation
 
             _progress(job, "Analyzing video…", 10, "analyzing", log_buffer)
 
@@ -335,7 +411,7 @@ def handler(job):
             summary = compute_summary(
                 results,
                 action_confidence=action_confidence,
-                min_separation=3,
+                min_separation=min_separation,
                 gap_threshold=analyzer.get_gap_threshold(),
             )
 
