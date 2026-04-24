@@ -8,3 +8,4 @@ tqdm>=4.65
 pyyaml>=6.0
 requests>=2.31
 onnxruntime-gpu>=1.17
+ultralytics>=8.2

@@ -20,7 +20,7 @@
 #
 # Config-only keys (changing them requires worker restart):
 #   device, models_dir, use_gap_grouping, assign_single_fighter,
-#   side_confidence_min, stable_side_frames
+#   side_confidence_min, stable_side_frames, yolo_run
 #
 # Supabase credentials and other secrets remain RunPod environment variables
 # (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_BUCKET). This file only
@@ -60,3 +60,19 @@ stable_side_frames: 0
 # Whether to render and upload an annotated video by default. Per-job input
 # may override this.
 save_video: true
+
+# Person detector selection (strict XOR with the unified detector; no fallback).
+#
+#   yolo_run: false  (default) → load the unified ONNX detector from
+#                                 models/unified/unified_model.onnx (+ .meta.json).
+#   yolo_run: true            → load the Ultralytics YOLO three-class detector
+#                                 from models/yolo/weights/best.onnx and read
+#                                 class order / imgsz / iou from
+#                                 configs/yolo_detector.yaml. The unified ONNX
+#                                 session is NOT created in this mode.
+#
+# YOLO mode requires the `ultralytics` package in the image and a matching
+# configs/yolo_detector.yaml. Missing weights or config fail fast at worker
+# startup (no cross-mode fallback). Config-only: changing this value requires
+# a worker restart / image redeploy.
+yolo_run: false

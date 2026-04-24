@@ -57,6 +57,14 @@ python3 scripts/inference_onnx.py --video video.mp4 --save_frames
 python3 scripts/inference_onnx.py --video video.mp4 --device cuda
 python3 scripts/inference_onnx.py --video video.mp4 --device cpu
 
+# YOLO person detector (strict XOR with unified; no fallback)
+python3 scripts/inference_onnx.py --video video.mp4 --yolo_run true
+# Unified (default): omit the flag, or be explicit with --yolo_run false
+python3 scripts/inference_onnx.py --video video.mp4 --yolo_run false
+# Requires models/yolo/weights/best.onnx AND configs/yolo_detector.yaml when true.
+# Unified ONNX is NOT loaded in this mode; missing files exit non-zero.
+# Requires the `ultralytics` package at runtime.
+
 ================================================================================
 ALL OPTIONS:
 ================================================================================
@@ -88,18 +96,36 @@ Side-assignment:
 Device:
   --device NAME            auto | cuda | cpu (default: auto; ORT providers)
 
+Detector:
+  --yolo_run BOOL          true | false (also 1/0, yes/no, on/off). Default: false.
+                           true  = Ultralytics YOLO (models/yolo/weights/best.onnx
+                                   + configs/yolo_detector.yaml). Strict XOR with
+                                   unified — unified ONNX is NOT loaded.
+                                   Requires the `ultralytics` package.
+                           false = Unified ONNX detector (default; also the
+                                   behavior when the flag is omitted).
+                           Exits non-zero if required files for the selected mode
+                           are missing (no cross-mode fallback).
+
 ================================================================================
 REQUIRED ARTIFACTS:
 ================================================================================
 
-models/unified/unified_model.onnx
-models/unified/unified_model.meta.json
+Unified mode (default):
+  models/unified/unified_model.onnx
+  models/unified/unified_model.meta.json
 
-Optional (per action type from configs/action_types.yaml):
-models/actions/<type>/<type>_model.onnx
-models/actions/<type>/<type>_model.meta.json
+YOLO mode (--yolo_run true; strict XOR with unified):
+  models/yolo/weights/best.onnx         # exported via Ultralytics (not 12_export_onnx.py)
+  configs/yolo_detector.yaml            # class order + imgsz + default conf/iou
 
-Generate with: python3 scripts/12_export_onnx.py --model all
+Optional (per action type from configs/action_types.yaml, both modes):
+  models/actions/<type>/<type>_model.onnx
+  models/actions/<type>/<type>_model.meta.json
+
+Generate unified + actions with: python3 scripts/12_export_onnx.py --model all
+Export YOLO separately:
+  yolo export model=models/yolo/weights/best.pt format=onnx imgsz=640
 
 ================================================================================
 OUTPUT:
@@ -126,19 +152,59 @@ import sys
 from pathlib import Path
 
 
-def _check_onnx_artifacts(models_dir: Path):
-    """Fail fast if required ONNX artifacts are missing."""
-    unified_onnx = models_dir / 'unified' / 'unified_model.onnx'
-    unified_meta = models_dir / 'unified' / 'unified_model.meta.json'
+def _parse_bool(value: str) -> bool:
+    """Parse a CLI boolean argument (accepts true/false, 1/0, yes/no, on/off).
 
-    if not unified_onnx.exists():
-        print(f"ERROR: Unified ONNX model not found: {unified_onnx}")
-        print("Run 12_export_onnx.py to generate ONNX exports first.")
-        sys.exit(1)
-    if not unified_meta.exists():
-        print(f"ERROR: Unified metadata not found: {unified_meta}")
-        print("Run 12_export_onnx.py to generate .meta.json sidecars.")
-        sys.exit(1)
+    Used by ``--yolo_run`` so the flag takes an explicit value instead of
+    behaving as a bare switch, e.g. ``--yolo_run true`` / ``--yolo_run false``.
+    """
+    v = str(value).strip().lower()
+    if v in ('1', 'true', 't', 'yes', 'y', 'on'):
+        return True
+    if v in ('0', 'false', 'f', 'no', 'n', 'off'):
+        return False
+    raise argparse.ArgumentTypeError(
+        f"expected a boolean value (true/false, 1/0, yes/no, on/off); got {value!r}"
+    )
+
+
+def _check_onnx_artifacts(models_dir: Path, yolo_run: bool = False):
+    """Fail fast if required ONNX artifacts are missing.
+
+    Strict XOR between the unified detector and YOLO:
+
+    - ``yolo_run=False`` (default): require unified ``.onnx`` + ``.meta.json``.
+    - ``yolo_run=True``: require ``models/yolo/weights/best.onnx`` and
+      ``configs/yolo_detector.yaml``; unified ONNX is NOT required.
+
+    Action ONNX models are optional in either mode — a warning is printed if
+    none are present so callers can still run detector-only smoke tests.
+    """
+    if yolo_run:
+        yolo_weights = models_dir / 'yolo' / 'weights' / 'best.onnx'
+        yolo_cfg = Path('configs/yolo_detector.yaml')
+        missing = [p for p in (yolo_weights, yolo_cfg) if not p.exists()]
+        if missing:
+            print("ERROR: --yolo_run true requires the following files:")
+            for p in missing:
+                print(f"  - {p} (missing)")
+            print("Export YOLO to ONNX (see main_usage_guides/09_MODEL_TRAINING.md) "
+                  "or use --yolo_run false (the default) to run the unified ONNX detector.")
+            sys.exit(1)
+        detector_summary = f"yolo OK ({yolo_weights})"
+    else:
+        unified_onnx = models_dir / 'unified' / 'unified_model.onnx'
+        unified_meta = models_dir / 'unified' / 'unified_model.meta.json'
+
+        if not unified_onnx.exists():
+            print(f"ERROR: Unified ONNX model not found: {unified_onnx}")
+            print("Run 12_export_onnx.py to generate ONNX exports first.")
+            sys.exit(1)
+        if not unified_meta.exists():
+            print(f"ERROR: Unified metadata not found: {unified_meta}")
+            print("Run 12_export_onnx.py to generate .meta.json sidecars.")
+            sys.exit(1)
+        detector_summary = "unified OK"
 
     actions_dir = models_dir / 'actions'
     found_actions = 0
@@ -155,7 +221,7 @@ def _check_onnx_artifacts(models_dir: Path):
     if found_actions == 0:
         print("WARNING: No action ONNX models found. Action detection will be unavailable.")
 
-    print(f"Artifacts check: unified OK, {found_actions} action model(s) found.")
+    print(f"Artifacts check: {detector_summary}, {found_actions} action model(s) found.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -195,6 +261,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--device', type=str, default='auto',
                         help='Device (auto/cuda/cpu)')
 
+    parser.add_argument('--yolo_run', type=_parse_bool, default=False,
+                        metavar='BOOL',
+                        help='Use the Ultralytics YOLO three-class detector '
+                             '(models/yolo/weights/best.onnx + configs/yolo_detector.yaml) '
+                             'instead of the unified ONNX model. Accepts true/false '
+                             '(also 1/0, yes/no, on/off). Omitted or "false" = unified; '
+                             '"true" = YOLO. Strict XOR — unified ONNX is not loaded '
+                             'in YOLO mode; missing files exit non-zero. Requires the '
+                             '`ultralytics` package when true. Default: false.')
+
     return parser.parse_args()
 
 
@@ -205,7 +281,7 @@ def main():
         print(f"ERROR: Video not found: {args.video}")
         sys.exit(1)
 
-    _check_onnx_artifacts(args.models)
+    _check_onnx_artifacts(args.models, yolo_run=args.yolo_run)
 
     # Add scripts/ to sys.path so relative imports in BVA work
     script_dir = Path(__file__).resolve().parent

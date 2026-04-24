@@ -9,9 +9,6 @@ identical for both backends; only model forward passes differ (PyTorch vs ORT).
 
 Entry-point scripts call run_main(args, backend=...). See also
 scripts/utils/ort_video_backend.py and scripts/utils/onnx_model_metadata.py.
-
-When analyze_video() is called with progress_callback, callback kwargs include
-score_range, detection_threshold, and boxes_above_threshold for live status UIs.
 """
 
 
@@ -519,6 +516,7 @@ class BoxingAnalyzer:
         stable_side_frames: int = 0,
         use_gap_grouping: bool = False,
         backend: str = 'pytorch',
+        yolo_run: bool = False,
     ):
         self.models_dir = Path(models_dir)
         self.backend = backend
@@ -530,6 +528,7 @@ class BoxingAnalyzer:
         self.side_confidence_min = side_confidence_min
         self.stable_side_frames = stable_side_frames
         self.use_gap_grouping = use_gap_grouping
+        self.yolo_run = yolo_run
 
         # ONNX-specific state (populated by _load_onnx_models)
         self._ort_unified_session = None
@@ -543,12 +542,20 @@ class BoxingAnalyzer:
         self.label_maps = {}
         self._detection_unavailable_warned = False
 
+        # YOLO detector state (populated by _load_yolo_detector when yolo_run=True)
+        self._yolo_model = None
+        self._yolo_settings = None  # Parsed configs/yolo_detector.yaml contents
+
         if backend == 'onnx':
             self.device = device  # stored as string for ORT provider selection
+            if self.yolo_run:
+                self._load_yolo_detector()
             self._load_onnx_models()
         else:
             self.device = get_device(device)
             print(f"Using device: {self.device}")
+            if self.yolo_run:
+                self._load_yolo_detector()
             self._load_models()
             self._setup_transforms()
 
@@ -1100,22 +1107,30 @@ class BoxingAnalyzer:
         return persons
     
     def _load_onnx_models(self):
-        """Load ONNX models and metadata (onnx backend)."""
+        """Load ONNX models and metadata (onnx backend).
+
+        When ``self.yolo_run`` is True the unified ONNX session is skipped
+        entirely (YOLO owns person detection); action ONNX sessions always
+        load so downstream action heads remain unchanged.
+        """
         from .ort_video_backend import create_session
         from .onnx_model_metadata import load_unified_metadata, load_action_metadata
 
         device_str = self.device if isinstance(self.device, str) else 'auto'
 
-        # Unified model
-        unified_onnx = self.models_dir / 'unified' / 'unified_model.onnx'
-        if unified_onnx.exists():
-            print(f"Loading unified ONNX model: {unified_onnx}")
-            self._ort_unified_meta = load_unified_metadata(self.models_dir)
-            self._ort_unified_session = create_session(unified_onnx, device_str)
-        else:
-            print(f"WARNING: Unified ONNX model not found: {unified_onnx}")
+        # Unified ONNX session — loaded only in unified mode (strict XOR with YOLO).
+        if not self.yolo_run:
+            unified_onnx = self.models_dir / 'unified' / 'unified_model.onnx'
+            if unified_onnx.exists():
+                print(f"Loading unified ONNX model: {unified_onnx}")
+                self._ort_unified_meta = load_unified_metadata(self.models_dir)
+                self._ort_unified_session = create_session(unified_onnx, device_str)
+            else:
+                raise FileNotFoundError(
+                    f"Unified ONNX model not found: {unified_onnx}. "
+                    "Provide the exported unified model or run with --yolo_run."
+                )
 
-        # Action models
         actions_dir = self.models_dir / 'actions'
         if actions_dir.exists():
             for action_type in ACTION_TYPES:
@@ -1131,29 +1146,36 @@ class BoxingAnalyzer:
             print("WARNING: No action ONNX models found.")
 
     def _load_models(self):
-        """Load all available models."""
-        
-        # Try to load unified model - check both standard and MPS versions (best.pt or last.pt)
-        unified_dir = self.models_dir / 'unified'
-        unified_mps_dir = self.models_dir / 'unified_mps'
-        unified_path = (unified_dir / 'best.pt') if (unified_dir / 'best.pt').exists() else (unified_dir / 'last.pt')
-        unified_mps_path = (unified_mps_dir / 'best.pt') if (unified_mps_dir / 'best.pt').exists() else (unified_mps_dir / 'last.pt')
-        
-        if unified_path.exists():
-            print(f"Loading unified model (Faster R-CNN): {unified_path}")
-            self.unified_model = self._load_unified_model(unified_path, model_type='fasterrcnn')
-            print("  Unified model loaded successfully")
-        elif unified_mps_path.exists():
-            print(f"Loading unified model (SSD/MPS): {unified_mps_path}")
-            self.unified_model = self._load_unified_model(unified_mps_path, model_type='ssd_mps')
-            print("  Unified MPS model loaded successfully")
-        else:
-            print(f"WARNING: No unified model found at:")
-            print(f"  - {unified_dir / 'best.pt'} or {unified_dir / 'last.pt'}")
-            print(f"  - {unified_mps_dir / 'best.pt'} or {unified_mps_dir / 'last.pt'}")
-            print("  Detection and attribute classification will not be available.")
-        
-        # Load action models (for all 7 types if present)
+        """Load all available PyTorch models.
+
+        When ``self.yolo_run`` is True unified checkpoints are skipped entirely
+        (YOLO owns person detection). Action checkpoints always load so the
+        downstream action heads remain unchanged across detector choices.
+        """
+
+        # Unified checkpoints — loaded only in unified mode (strict XOR with YOLO).
+        if not self.yolo_run:
+            unified_dir = self.models_dir / 'unified'
+            unified_mps_dir = self.models_dir / 'unified_mps'
+            unified_path = (unified_dir / 'best.pt') if (unified_dir / 'best.pt').exists() else (unified_dir / 'last.pt')
+            unified_mps_path = (unified_mps_dir / 'best.pt') if (unified_mps_dir / 'best.pt').exists() else (unified_mps_dir / 'last.pt')
+
+            if unified_path.exists():
+                print(f"Loading unified model (Faster R-CNN): {unified_path}")
+                self.unified_model = self._load_unified_model(unified_path, model_type='fasterrcnn')
+                print("  Unified model loaded successfully")
+            elif unified_mps_path.exists():
+                print(f"Loading unified model (SSD/MPS): {unified_mps_path}")
+                self.unified_model = self._load_unified_model(unified_mps_path, model_type='ssd_mps')
+                print("  Unified MPS model loaded successfully")
+            else:
+                raise FileNotFoundError(
+                    "No unified PyTorch checkpoint found. Looked for: "
+                    f"{unified_dir / 'best.pt'} or {unified_dir / 'last.pt'}; "
+                    f"{unified_mps_dir / 'best.pt'} or {unified_mps_dir / 'last.pt'}. "
+                    "Train/download a unified checkpoint or run with --yolo_run."
+                )
+
         actions_dir = self.models_dir / 'actions'
         if actions_dir.exists():
             for action_type in ACTION_TYPES:
@@ -1162,10 +1184,71 @@ class BoxingAnalyzer:
                     print(f"Loading {action_type} model: {action_path}")
                     self.action_models[action_type] = self._load_action_model(action_path)
                     print(f"  {action_type} model loaded")
-        
+
         if not self.action_models:
             print("WARNING: No action models found. Action detection will not be available.")
-    
+
+    def _load_yolo_detector(self):
+        """Load the Ultralytics YOLO person detector and its contract YAML.
+
+        Strict selection — only called when ``self.yolo_run`` is True and the
+        chosen backend dictates which weight file we accept:
+
+        - ``backend == 'pytorch'`` → ``models/yolo/weights/best.pt``
+        - ``backend == 'onnx'``    → ``models/yolo/weights/best.onnx``
+
+        No ``last.pt`` / no cross-backend fallback. Missing config or weights
+        raise ``FileNotFoundError`` so CLIs surface a fail-fast exit before any
+        frames are analyzed.
+        """
+        import yaml
+
+        config_path = Path('configs/yolo_detector.yaml')
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"YOLO detector config not found: {config_path}. "
+                "It is required for --yolo_run (class order, imgsz, thresholds)."
+            )
+        with open(config_path, 'r') as fh:
+            yolo_cfg = yaml.safe_load(fh) or {}
+
+        class_names = yolo_cfg.get('classes') or []
+        if not class_names:
+            raise ValueError(
+                f"{config_path} must define a 'classes' list "
+                "(expected order: fighter_red, fighter_blue, referee)."
+            )
+
+        weights_ext = 'onnx' if self.backend == 'onnx' else 'pt'
+        weights_path = self.models_dir / 'yolo' / 'weights' / f'best.{weights_ext}'
+        if not weights_path.exists():
+            raise FileNotFoundError(
+                f"YOLO weights not found: {weights_path}. "
+                "Train/export YOLO (see main_usage_guides/09_MODEL_TRAINING.md) "
+                "or drop --yolo_run to use the unified detector."
+            )
+
+        # Ultralytics is a heavy optional dependency; import lazily so the
+        # default (unified) workflow never pays the import cost.
+        try:
+            from ultralytics import YOLO  # type: ignore
+        except ImportError as exc:
+            raise ImportError(
+                "--yolo_run requires the 'ultralytics' package. "
+                "Install it with `pip install ultralytics` and retry."
+            ) from exc
+
+        print(f"Loading YOLO detector ({self.backend}): {weights_path}")
+        self._yolo_model = YOLO(str(weights_path))
+
+        self._yolo_settings = {
+            'class_names': list(class_names),
+            'imgsz': int(yolo_cfg.get('imgsz', 640)),
+            'conf': float(yolo_cfg.get('conf', 0.25)),
+            'iou': float(yolo_cfg.get('iou', 0.45)),
+            'letterbox': bool(yolo_cfg.get('letterbox', True)),
+        }
+
     def _load_unified_model(self, path: Path, model_type: str = 'fasterrcnn') -> Dict:
         """Load unified detection + attributes model.
         
@@ -1374,7 +1457,6 @@ class BoxingAnalyzer:
         self,
         video_path: str,
         progress: bool = True,
-        progress_callback=None,
     ) -> Dict:
         """
         Analyze entire video.
@@ -1382,8 +1464,6 @@ class BoxingAnalyzer:
         Args:
             video_path: Path to video file
             progress: Show progress bar
-            progress_callback: Optional callable(current_frame, total_frames, **kw)
-                invoked every few frames with live stats for remote progress reporting.
             
         Returns:
             Dict with video metadata and frame-by-frame analysis
@@ -1430,7 +1510,6 @@ class BoxingAnalyzer:
         
         # Process frames
         frame_idx = 0
-        _pc_t0 = time.time()
         iterator = range(total_frames)
         if progress:
             iterator = tqdm(iterator, desc="Analyzing frames")
@@ -1454,29 +1533,6 @@ class BoxingAnalyzer:
             
             if progress:
                 iterator.update(1) if hasattr(iterator, 'update') else None
-            
-            if progress_callback and frame_idx % 5 == 0:
-                boxes = len(frame_result.get('persons', []))
-                confs = [
-                    p['confidence'] for p in frame_result.get('persons', [])
-                    if 'confidence' in p
-                ]
-                score_range = (
-                    f"{min(confs):.4f}-{max(confs):.4f}"
-                    if confs else "unknown"
-                )
-                progress_callback(
-                    current_frame=frame_idx,
-                    total_frames=total_frames,
-                    fps=frame_idx / max(time.time() - _pc_t0, 1e-6),
-                    boxes_detected=boxes,
-                    avg_confidence=sum(confs) / len(confs) if confs else 0.0,
-                    video_resolution=f"{width}x{height}",
-                    video_fps=fps,
-                    score_range=score_range,
-                    detection_threshold=self.confidence,
-                    boxes_above_threshold=boxes,
-                )
         
         cap.release()
         
@@ -1510,11 +1566,12 @@ class BoxingAnalyzer:
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
         # 1. Detect persons and classify attributes
-        has_unified = (
+        has_person_detector = (
             self.unified_model is not None
             or self._ort_unified_session is not None
+            or self._yolo_model is not None
         )
-        if has_unified:
+        if has_person_detector:
             persons = self._detect_persons_unified(frame_rgb)
             # Apply tracking and sticky corner assignment
             persons = self._assign_tracks_and_corners(persons, frame_idx)
@@ -1555,7 +1612,14 @@ class BoxingAnalyzer:
         - 'fasterrcnn': From 07_train_unified.py (standard, uses torchvision Faster R-CNN)
         - 'ssd_mps': From 07_train_unified_mps.py (MPS-optimized, custom SSD architecture)
         - ONNX: Via ORT session when backend='onnx'
+
+        When ``self.yolo_run`` is True and a YOLO model is loaded, delegate to
+        :meth:`_detect_persons_yolo` so the unified PyTorch/ONNX branches below
+        are never executed (strict XOR selection).
         """
+        if self.yolo_run and self._yolo_model is not None:
+            return self._detect_persons_yolo(frame_rgb)
+
         if self.backend == 'onnx':
             return self._detect_persons_unified_onnx(frame_rgb)
 
@@ -1677,7 +1741,91 @@ class BoxingAnalyzer:
                     pass
         
         return persons
-    
+
+    def _detect_persons_yolo(self, frame_rgb: np.ndarray) -> List[Dict]:
+        """Detect persons via the Ultralytics YOLO three-class detector.
+
+        Emits the same person dict schema consumed by
+        :meth:`_assign_tracks_and_corners` so tracking / side-to-corner mapping
+        / event logic stay unchanged. YOLO does not predict attributes other
+        than corner/role, so ``guard``/``stance``/``lead_hand``/``visibility``/
+        ``headgear`` are filled with ``'unknown'`` (and ``embedding`` is
+        ``None`` — appearance features are unified-only).
+
+        Class mapping (per configs/yolo_detector.yaml):
+            0 → role=fighter, corner=red
+            1 → role=fighter, corner=blue
+            2 → role=referee, corner=unknown
+        """
+        if self._yolo_model is None or self._yolo_settings is None:
+            return []
+
+        settings = self._yolo_settings
+        h, w = frame_rgb.shape[:2]
+        # Ultralytics accepts numpy frames directly; BGR matches the model's
+        # training preprocessing (OpenCV input). Convert back from our RGB.
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+        results = self._yolo_model.predict(
+            source=frame_bgr,
+            imgsz=settings['imgsz'],
+            conf=float(self.confidence),  # runtime override of YAML conf
+            iou=settings['iou'],
+            verbose=False,
+        )
+
+        if not results:
+            return []
+
+        boxes_obj = getattr(results[0], 'boxes', None)
+        if boxes_obj is None or len(boxes_obj) == 0:
+            return []
+
+        xyxy = boxes_obj.xyxy.cpu().numpy()
+        confs = boxes_obj.conf.cpu().numpy()
+        cls_ids = boxes_obj.cls.cpu().numpy().astype(int)
+
+        persons: List[Dict] = []
+        for (x1, y1, x2, y2), score, cls_id in zip(xyxy, confs, cls_ids):
+            x1c = float(np.clip(x1, 0.0, w))
+            y1c = float(np.clip(y1, 0.0, h))
+            x2c = float(np.clip(x2, 0.0, w))
+            y2c = float(np.clip(y2, 0.0, h))
+            if x2c <= x1c or y2c <= y1c:
+                continue
+
+            score_f = float(score)
+            if cls_id == 0:
+                corner, role = 'red', 'fighter'
+            elif cls_id == 1:
+                corner, role = 'blue', 'fighter'
+            else:
+                corner, role = 'unknown', 'referee'
+
+            person = {
+                'box': [x1c, y1c, x2c, y2c],
+                'confidence': score_f,
+                'label': int(cls_id),
+                'embedding': None,
+                'corner': corner,
+                'corner_confidence': score_f,
+                'role': role,
+                'role_confidence': score_f,
+                'guard': 'unknown',
+                'guard_confidence': 0.0,
+                'stance': 'unknown',
+                'stance_confidence': 0.0,
+                'lead_hand': 'unknown',
+                'lead_hand_confidence': 0.0,
+                'visibility': 'unknown',
+                'visibility_confidence': 0.0,
+                'headgear': 'unknown',
+                'headgear_confidence': 0.0,
+            }
+            persons.append(person)
+
+        return persons
+
     def _detect_actions(self, frame_buffer: List[np.ndarray]) -> Dict:
         """
         Detect actions using temporal action models.
@@ -3049,6 +3197,7 @@ def run_main(args, backend='pytorch'):
         stable_side_frames=args.stable_side_frames,
         use_gap_grouping=args.use_gap_grouping,
         backend=backend,
+        yolo_run=getattr(args, 'yolo_run', False),
     )
     
     start_time = time.time()

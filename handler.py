@@ -11,12 +11,20 @@ Progress payload contract:
   Unknown values are sent as the explicit string "unknown".
 
 Inference defaults:
-  All inference knobs (device, thresholds, grouping, models_dir, etc.) live
-  in configs/inference.yaml. Edit that file (and rebuild the image, or mount
-  a replacement) to change defaults. Per-job values in job["input"] override
-  the YAML for these keys only:
+  All inference knobs (device, thresholds, grouping, models_dir, yolo_run,
+  etc.) live in configs/inference.yaml. Edit that file (and rebuild the
+  image, or mount a replacement) to change defaults. Per-job values in
+  job["input"] override the YAML for these keys only:
     confidence, attr_confidence, action_confidence, save_video, min_separation
   All other YAML keys are config-only and require a worker restart to apply.
+
+Detector selection:
+  configs/inference.yaml → `yolo_run: false` (default) loads the unified
+  ONNX detector (models/unified/unified_model.onnx + .meta.json).
+  `yolo_run: true` loads the Ultralytics YOLO three-class detector
+  (models/yolo/weights/best.onnx + configs/yolo_detector.yaml) instead;
+  the unified session is NOT created. Strict XOR — missing files for the
+  selected mode fail fast at worker startup.
 
 Environment variables (set in RunPod dashboard → endpoint → secrets):
   SUPABASE_URL              – e.g. https://xxxx.supabase.co
@@ -172,9 +180,20 @@ def _supabase_configured() -> bool:
 
 MODEL = None
 
+YOLO_RUN = _coerce_bool(INFERENCE_DEFAULTS.get("yolo_run"), False)
 
-def _unified_checkpoint_present(models_root: Path) -> bool:
-    """True if a unified model artifact is present under models_root (.pt or ONNX)."""
+
+def _detector_weights_present(models_root: Path, yolo_run: bool) -> bool:
+    """True if the artifacts required by the selected detector live under models_root.
+
+    - ``yolo_run=False``: look for a unified model artifact (.pt or ONNX).
+    - ``yolo_run=True``: look for the exported YOLO ONNX weight
+      (``<models_root>/yolo/weights/best.onnx``). The ONNX runtime is the
+      only backend this handler uses, so we do not probe for ``best.pt``.
+    """
+    if yolo_run:
+        return (models_root / "yolo" / "weights" / "best.onnx").exists()
+
     u = models_root / "unified"
     m = models_root / "unified_mps"
     for base in (u, m):
@@ -185,13 +204,15 @@ def _unified_checkpoint_present(models_root: Path) -> bool:
     return False
 
 
-def _diagnose_paths():
+def _diagnose_paths(yolo_run: bool = False):
     """Print diagnostic info about model directories so volume issues are obvious."""
     vol_root = Path("/runpod-volume")
     vol_models = vol_root / "models"
     app_models = PROJECT_ROOT / "models"
+    subdir = "yolo/weights" if yolo_run else "unified"
 
     print("--- Model path diagnostics ---")
+    print(f"  detector mode: {'yolo' if yolo_run else 'unified'}")
     print(f"  /runpod-volume exists: {vol_root.exists()}")
     if vol_root.exists():
         try:
@@ -205,10 +226,10 @@ def _diagnose_paths():
         try:
             contents = list(vol_models.iterdir())
             print(f"  /runpod-volume/models contents: {[p.name for p in contents]}")
-            unified = vol_models / "unified"
-            if unified.exists():
-                u_contents = list(unified.iterdir())
-                print(f"  /runpod-volume/models/unified contents: {[p.name for p in u_contents]}")
+            inspect = vol_models / subdir
+            if inspect.exists():
+                print(f"  /runpod-volume/models/{subdir} contents: "
+                      f"{[p.name for p in inspect.iterdir()]}")
         except PermissionError:
             print("  /runpod-volume/models: permission denied listing contents")
 
@@ -222,8 +243,14 @@ def _diagnose_paths():
     print("--- End diagnostics ---")
 
 
-def _resolve_models_dir() -> str:
-    """Pick weights directory: YAML models_dir, else baked /app/models, else volume."""
+def _resolve_models_dir(yolo_run: bool) -> str:
+    """Pick weights directory: YAML models_dir, else baked /app/models, else volume.
+
+    The probe depends on ``yolo_run``: unified artifacts for the unified
+    detector, YOLO ONNX weights for YOLO mode. This prevents a YOLO-only
+    deploy from silently pointing at a stale unified-models directory (or
+    vice versa).
+    """
     override = str(INFERENCE_DEFAULTS.get("models_dir") or "").strip()
     if override:
         print(f"models_dir override from inference config: {override}")
@@ -231,17 +258,18 @@ def _resolve_models_dir() -> str:
 
     app_models = PROJECT_ROOT / "models"
     vol_models = Path("/runpod-volume/models")
+    label = "YOLO weights" if yolo_run else "unified checkpoint"
 
-    if _unified_checkpoint_present(app_models):
-        print("Found unified checkpoint in /app/models (baked into image)")
+    if _detector_weights_present(app_models, yolo_run):
+        print(f"Found {label} in /app/models (baked into image)")
         return str(app_models)
-    if _unified_checkpoint_present(vol_models):
-        print("Found unified checkpoint in /runpod-volume/models (network volume)")
+    if _detector_weights_present(vol_models, yolo_run):
+        print(f"Found {label} in /runpod-volume/models (network volume)")
         return str(vol_models)
 
-    _diagnose_paths()
+    _diagnose_paths(yolo_run)
     print(
-        "WARNING: No unified checkpoint found in /app/models or /runpod-volume/models. "
+        f"WARNING: No {label} found in /app/models or /runpod-volume/models. "
         "Is the network volume attached to this endpoint? "
         "(Serverless → endpoint → Edit → Advanced → Network Volumes)"
     )
@@ -254,9 +282,9 @@ def load_model():
         return MODEL
     cfg = INFERENCE_DEFAULTS
     device = "cpu" if str(cfg.get("device", "cuda")).lower() == "cpu" else "cuda"
-    models_dir = _resolve_models_dir()
-    print(f"Using models_dir={models_dir}")
-    _check_onnx_artifacts(Path(models_dir))
+    models_dir = _resolve_models_dir(YOLO_RUN)
+    print(f"Using models_dir={models_dir} (yolo_run={YOLO_RUN})")
+    _check_onnx_artifacts(Path(models_dir), yolo_run=YOLO_RUN)
     MODEL = BoxingAnalyzer(
         models_dir=models_dir,
         device=device,
@@ -269,6 +297,7 @@ def load_model():
         stable_side_frames=int(cfg.get("stable_side_frames", 0)),
         use_gap_grouping=_coerce_bool(cfg.get("use_gap_grouping"), True),
         backend="onnx",
+        yolo_run=YOLO_RUN,
     )
     return MODEL
 

@@ -56,6 +56,13 @@ python3 scripts/10_inference.py --video video.mp4 --save_frames
 # CPU inference
 python3 scripts/10_inference.py --video video.mp4 --device cpu
 
+# YOLO person detector (strict XOR with unified; no fallback)
+python3 scripts/10_inference.py --video video.mp4 --yolo_run true
+# Unified (default): omit the flag, or be explicit with --yolo_run false
+python3 scripts/10_inference.py --video video.mp4 --yolo_run false
+# Requires models/yolo/weights/best.pt AND configs/yolo_detector.yaml when true.
+# Unified weights are NOT loaded in this mode; missing files exit non-zero.
+
 ================================================================================
 ALL OPTIONS:
 ================================================================================
@@ -89,6 +96,16 @@ Side-assignment (fighter identity from left/right):
 Device:
   --device NAME            # auto (CUDA then CPU; not MPS) | cuda | mps | cpu
 
+Detector:
+  --yolo_run BOOL          # true | false (also 1/0, yes/no, on/off). Default: false.
+                           # true  = use Ultralytics YOLO (models/yolo/weights/best.pt
+                           #         + configs/yolo_detector.yaml). Strict XOR with
+                           #         unified — unified is NOT loaded.
+                           # false = use the unified detector (default).
+                           # Omitting the flag is equivalent to --yolo_run false.
+                           # Exits non-zero if required files for the selected mode
+                           # are missing (no cross-mode fallback).
+
 ================================================================================
 SIDE-ASSIGNMENT OPTIONS (fighter identity from left/right mapping):
 ================================================================================
@@ -120,20 +137,26 @@ REQUIRED MODELS:
 ================================================================================
 
 models/
-├── unified/best.pt          # Detection + attributes (Faster R-CNN)
+├── unified/best.pt          # Detection + attributes (Faster R-CNN) — default mode
 │   OR
 ├── unified_mps/best.pt      # Detection + attributes (SSD, for Apple Silicon)
 │
-└── actions/                  # Action recognition (temporal)
+├── yolo/weights/best.pt     # Three-class YOLO detector (ONLY when --yolo_run true)
+│                            # Requires configs/yolo_detector.yaml at repo root.
+│                            # No last.pt fallback for YOLO.
+│
+└── actions/                  # Action recognition (temporal) — always required
     ├── punch/best.pt
     ├── defense/best.pt
     ├── footwork/best.pt
     └── clinch/best.pt
 
-NOTE: The script auto-detects which unified model is available.
-      Both produce compatible outputs for inference.
-      The Faster R-CNN unified model is loaded from 07_train_unified.py (same
-      architecture) so checkpoints load correctly.
+NOTE: Person detector selection is strict XOR. With --yolo_run false (default,
+      also when omitted) the script auto-detects a unified checkpoint
+      (best.pt → last.pt under unified/ then unified_mps/) and fails fast if
+      none exists. With --yolo_run true it loads YOLO only; missing YOLO
+      weights or configs/yolo_detector.yaml exit non-zero (no automatic
+      fallback to unified).
 
 INFERENCE BEHAVIOUR (Story 15):
 - Frame buffer size for action models is taken from the loaded checkpoints:
@@ -243,6 +266,22 @@ import argparse
 import sys
 from pathlib import Path
 
+
+def _parse_bool(value: str) -> bool:
+    """Parse a CLI boolean argument (accepts true/false, 1/0, yes/no, on/off).
+
+    Used by ``--yolo_run`` so the flag takes an explicit value instead of
+    behaving as a bare switch, e.g. ``--yolo_run true`` / ``--yolo_run false``.
+    """
+    v = str(value).strip().lower()
+    if v in ('1', 'true', 't', 'yes', 'y', 'on'):
+        return True
+    if v in ('0', 'false', 'f', 'no', 'n', 'off'):
+        return False
+    raise argparse.ArgumentTypeError(
+        f"expected a boolean value (true/false, 1/0, yes/no, on/off); got {value!r}"
+    )
+
 # ---------------------------------------------------------------------------
 # Re-export all public symbols from batch_video_analyzer so existing callers
 # (e.g. 13_evaluate_test.py) that do `mod10.BoxingAnalyzer(...)` keep working.
@@ -329,11 +368,60 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--device', type=str, default='auto',
                         help='Device: auto = CUDA if available else CPU; use mps only with --device mps')
 
+    # Detector selection (strict XOR with unified; no fallback, no last.pt for YOLO)
+    parser.add_argument('--yolo_run', type=_parse_bool, default=False,
+                        metavar='BOOL',
+                        help='Use the Ultralytics YOLO three-class detector '
+                             '(models/yolo/weights/best.pt + configs/yolo_detector.yaml) '
+                             'instead of the unified model. Accepts true/false '
+                             '(also 1/0, yes/no, on/off). Omitted or "false" = '
+                             'unified; "true" = YOLO. Exits if required files are '
+                             'missing; no fallback to unified. Default: false.')
+
     return parser.parse_args()
+
+
+def _check_pytorch_artifacts(args: argparse.Namespace) -> None:
+    """Fail-fast preflight for the PyTorch batch pipeline.
+
+    Strict XOR: when ``--yolo_run`` is set we require the YOLO .pt weight and
+    its YAML contract; otherwise we require a resolvable unified checkpoint
+    under ``models/unified/`` or ``models/unified_mps/`` (best.pt → last.pt).
+    Missing required artifacts exit non-zero *before* any video analysis.
+    """
+    models_dir = Path(args.models)
+
+    if args.yolo_run:
+        yolo_weights = models_dir / 'yolo' / 'weights' / 'best.pt'
+        yolo_cfg = Path('configs/yolo_detector.yaml')
+        missing = [p for p in (yolo_weights, yolo_cfg) if not p.exists()]
+        if missing:
+            print("ERROR: --yolo_run true requires the following files:")
+            for p in missing:
+                print(f"  - {p} (missing)")
+            print("Train / export YOLO (see main_usage_guides/09_MODEL_TRAINING.md) "
+                  "or use --yolo_run false (the default) to run the unified detector.")
+            sys.exit(1)
+        return
+
+    unified_candidates = [
+        models_dir / 'unified' / 'best.pt',
+        models_dir / 'unified' / 'last.pt',
+        models_dir / 'unified_mps' / 'best.pt',
+        models_dir / 'unified_mps' / 'last.pt',
+    ]
+    if not any(p.exists() for p in unified_candidates):
+        print("ERROR: No unified PyTorch checkpoint found. Looked for:")
+        for p in unified_candidates:
+            print(f"  - {p}")
+        print("Train a unified model (see main_usage_guides/09_MODEL_TRAINING.md) "
+              "or pass --yolo_run true to use the YOLO detector.")
+        sys.exit(1)
 
 
 def main():
     args = parse_args()
+    _check_pytorch_artifacts(args)
     run_main(args, backend='pytorch')
 
 
