@@ -1457,14 +1457,22 @@ class BoxingAnalyzer:
         self,
         video_path: str,
         progress: bool = True,
+        progress_callback=None,
     ) -> Dict:
         """
         Analyze entire video.
-        
+
         Args:
             video_path: Path to video file
-            progress: Show progress bar
-            
+            progress: Show local tqdm progress bar
+            progress_callback: Optional ``callable(current_frame, total_frames,
+                **kwargs)`` invoked after every processed frame. Used by the
+                RunPod handler to stream per-frame status to the frontend.
+                Receiver must tolerate arbitrary kwargs (forward-compat);
+                missing ones fall back to sensible defaults. Exceptions raised
+                inside the callback are swallowed so a UI glitch can never
+                abort analysis.
+
         Returns:
             Dict with video metadata and frame-by-frame analysis
         """
@@ -1530,12 +1538,30 @@ class BoxingAnalyzer:
                 frame_buffer.pop(0)
             
             frame_idx += 1
-            
+
             if progress:
                 iterator.update(1) if hasattr(iterator, 'update') else None
-        
+
+            if progress_callback is not None:
+                try:
+                    persons = frame_result.get('persons', []) or []
+                    confs = [p.get('confidence', 0.0) for p in persons]
+                    avg_conf = (sum(confs) / len(confs)) if confs else 0.0
+                    progress_callback(
+                        frame_idx,
+                        total_frames,
+                        fps=fps,
+                        boxes_detected=len(persons),
+                        avg_confidence=avg_conf,
+                        video_resolution=f"{width}x{height}",
+                        video_fps=fps,
+                        detection_threshold=self.confidence,
+                    )
+                except Exception:
+                    pass
+
         cap.release()
-        
+
         return results
     
     def analyze_frame(
