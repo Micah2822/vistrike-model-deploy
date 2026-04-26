@@ -1466,12 +1466,8 @@ class BoxingAnalyzer:
             video_path: Path to video file
             progress: Show local tqdm progress bar
             progress_callback: Optional ``callable(current_frame, total_frames,
-                **kwargs)`` invoked after every processed frame. Used by the
-                RunPod handler to stream per-frame status to the frontend.
-                Receiver must tolerate arbitrary kwargs (forward-compat);
-                missing ones fall back to sensible defaults. Exceptions raised
-                inside the callback are swallowed so a UI glitch can never
-                abort analysis.
+                **kwargs)`` invoked after each processed frame (e.g. RunPod
+                handler). Exceptions inside the callback are swallowed.
 
         Returns:
             Dict with video metadata and frame-by-frame analysis
@@ -1563,7 +1559,7 @@ class BoxingAnalyzer:
         cap.release()
 
         return results
-    
+
     def analyze_frame(
         self,
         frame: np.ndarray,
@@ -1599,8 +1595,15 @@ class BoxingAnalyzer:
         )
         if has_person_detector:
             persons = self._detect_persons_unified(frame_rgb)
-            # Apply tracking and sticky corner assignment
-            persons = self._assign_tracks_and_corners(persons, frame_idx)
+            if self.yolo_run:
+                # YOLO-only path: trust raw per-frame predictions. No sticky
+                # corners, no ghost/interpolated boxes, no referee rewiring.
+                # Assign a per-frame index as id for downstream code that
+                # expects one (summary CSV, etc.); no cross-frame tracking.
+                for i, p in enumerate(persons):
+                    p['id'] = i
+            else:
+                persons = self._assign_tracks_and_corners(persons, frame_idx)
             # Strip embeddings before storing (not JSON serializable, only used for tracking)
             frame_data['persons'] = [
                 {k: v for k, v in p.items() if k != 'embedding'}
@@ -1786,17 +1789,20 @@ class BoxingAnalyzer:
         if self._yolo_model is None or self._yolo_settings is None:
             return []
 
-        settings = self._yolo_settings
         h, w = frame_rgb.shape[:2]
         # Ultralytics accepts numpy frames directly; BGR matches the model's
         # training preprocessing (OpenCV input). Convert back from our RGB.
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
+        # Force Ultralytics defaults for imgsz (640) and iou (0.7) so the YOLO
+        # path mirrors `yolo predict model=... source=...` regardless of what
+        # configs/yolo_detector.yaml has. Only `conf` is user-tunable via
+        # --confidence.
         results = self._yolo_model.predict(
             source=frame_bgr,
-            imgsz=settings['imgsz'],
-            conf=float(self.confidence),  # runtime override of YAML conf
-            iou=settings['iou'],
+            imgsz=640,
+            conf=float(self.confidence),
+            iou=0.7,
             verbose=False,
         )
 
@@ -2411,58 +2417,86 @@ class BoxingAnalyzer:
             Annotated frame
         """
         annotated = frame.copy()
-        
-        # Draw persons - only RED and BLUE fighters (skip unknown/noise)
-        for person in frame_data.get('persons', []):
-            corner = person.get('corner', 'unknown')
-            
-            # Skip unknown boxes - these are false positives or referee (Story 8)
-            # Only draw assigned fighters (red/blue corners)
-            # Referee detections have corner='unknown' and role='referee', so they are filtered here
-            if corner not in ['red', 'blue']:
-                continue
-            
-            x1, y1, x2, y2 = [int(c) for c in person['box']]
-            color = COLORS.get(corner, COLORS['unknown'])
-            is_interpolated = person.get('interpolated', False)
-            
-            # Draw bounding box (dashed for interpolated/carried forward)
-            if is_interpolated:
-                # Draw dashed box for interpolated positions
-                dash_length = 10
-                for i in range(x1, x2, dash_length * 2):
-                    cv2.line(annotated, (i, y1), (min(i + dash_length, x2), y1), color, 2)
-                    cv2.line(annotated, (i, y2), (min(i + dash_length, x2), y2), color, 2)
-                for i in range(y1, y2, dash_length * 2):
-                    cv2.line(annotated, (x1, i), (x1, min(i + dash_length, y2)), color, 2)
-                    cv2.line(annotated, (x2, i), (x2, min(i + dash_length, y2)), color, 2)
-            else:
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-            
-            # Build label
-            guard = person.get('guard', 'unknown')
-            stance = person.get('stance', 'unknown')
-            label = f"{corner.upper()} | {guard} | {stance}"
-            if is_interpolated:
-                label += " [?]"  # Indicate interpolated
-            
-            # Draw label with background
+
+        if self.yolo_run:
+            # Minimal YOLO-style overlay: solid red/blue/ref boxes + class conf.
+            # No sticky-corner labels, no dashed lines, no attribute strings —
+            # mirrors `yolo predict model=... source=...` output.
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = 0.5
             thickness = 1
-            (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
-            
-            # Label background
-            cv2.rectangle(annotated, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
-            # Label text
-            cv2.putText(annotated, label, (x1 + 2, y1 - 4), font, font_scale, (0, 0, 0), thickness)
-            
-            # Confidence below box (or "interp" for interpolated)
-            if is_interpolated:
-                conf_text = "interp"
-            else:
-                conf_text = f"{person.get('confidence', 0):.0%}"
-            cv2.putText(annotated, conf_text, (x1, y2 + 15), font, 0.4, color, 1)
+            yolo_label_map = {
+                'red':     ('RED',  COLORS.get('red',  (0, 0, 255))),
+                'blue':    ('BLUE', COLORS.get('blue', (255, 0, 0))),
+                'referee': ('REF',  COLORS.get('unknown', (128, 128, 128))),
+            }
+            for person in frame_data.get('persons', []):
+                corner = person.get('corner', 'unknown')
+                role = person.get('role', 'fighter')
+                key = corner if corner in ('red', 'blue') else ('referee' if role == 'referee' else None)
+                if key is None:
+                    continue
+                name, color = yolo_label_map[key]
+
+                x1, y1, x2, y2 = [int(c) for c in person['box']]
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+
+                label = f"{name} {person.get('confidence', 0):.0%}"
+                (tw, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
+                cv2.rectangle(annotated, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
+                cv2.putText(annotated, label, (x1 + 2, y1 - 4), font, font_scale, (0, 0, 0), thickness)
+        else:
+            # Unified / tracked path: draw only RED and BLUE fighters (skip unknown/noise)
+            for person in frame_data.get('persons', []):
+                corner = person.get('corner', 'unknown')
+
+                # Skip unknown boxes - these are false positives or referee (Story 8)
+                # Only draw assigned fighters (red/blue corners)
+                # Referee detections have corner='unknown' and role='referee', so they are filtered here
+                if corner not in ['red', 'blue']:
+                    continue
+
+                x1, y1, x2, y2 = [int(c) for c in person['box']]
+                color = COLORS.get(corner, COLORS['unknown'])
+                is_interpolated = person.get('interpolated', False)
+
+                # Draw bounding box (dashed for interpolated/carried forward)
+                if is_interpolated:
+                    # Draw dashed box for interpolated positions
+                    dash_length = 10
+                    for i in range(x1, x2, dash_length * 2):
+                        cv2.line(annotated, (i, y1), (min(i + dash_length, x2), y1), color, 2)
+                        cv2.line(annotated, (i, y2), (min(i + dash_length, x2), y2), color, 2)
+                    for i in range(y1, y2, dash_length * 2):
+                        cv2.line(annotated, (x1, i), (x1, min(i + dash_length, y2)), color, 2)
+                        cv2.line(annotated, (x2, i), (x2, min(i + dash_length, y2)), color, 2)
+                else:
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+
+                # Build label
+                guard = person.get('guard', 'unknown')
+                stance = person.get('stance', 'unknown')
+                label = f"{corner.upper()} | {guard} | {stance}"
+                if is_interpolated:
+                    label += " [?]"  # Indicate interpolated
+
+                # Draw label with background
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.5
+                thickness = 1
+                (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+
+                # Label background
+                cv2.rectangle(annotated, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
+                # Label text
+                cv2.putText(annotated, label, (x1 + 2, y1 - 4), font, font_scale, (0, 0, 0), thickness)
+
+                # Confidence below box (or "interp" for interpolated)
+                if is_interpolated:
+                    conf_text = "interp"
+                else:
+                    conf_text = f"{person.get('confidence', 0):.0%}"
+                cv2.putText(annotated, conf_text, (x1, y2 + 15), font, 0.4, color, 1)
         
         # Draw persistent event log at top left (replaces flickering action tags)
         current_frame = frame_data.get('frame', 0)

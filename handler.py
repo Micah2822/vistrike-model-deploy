@@ -35,6 +35,7 @@ Environment variables (set in RunPod dashboard → endpoint → secrets):
 """
 
 import io
+import inspect
 import os
 import sys
 import json
@@ -430,9 +431,20 @@ def handler(job):
                 })
 
             start = time.time()
-            results = analyzer.analyze_video(
-                str(video_path), progress_callback=on_frame_progress
-            )
+            if "progress_callback" in inspect.signature(
+                analyzer.analyze_video
+            ).parameters:
+                results = analyzer.analyze_video(
+                    str(video_path), progress_callback=on_frame_progress
+                )
+            else:
+                print(
+                    "WARNING: analyze_video has no progress_callback; "
+                    "per-frame progress disabled. Redeploy so "
+                    "scripts/utils/batch_video_analyzer.py matches handler.py.",
+                    flush=True,
+                )
+                results = analyzer.analyze_video(str(video_path))
             elapsed = time.time() - start
 
             _progress(job, "Computing summary…", 80, "computing_summary", log_buffer)
