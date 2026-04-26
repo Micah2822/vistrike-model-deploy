@@ -75,4 +75,4 @@ save_video: true
 # configs/yolo_detector.yaml. Missing weights or config fail fast at worker
 # startup (no cross-mode fallback). Config-only: changing this value requires
 # a worker restart / image redeploy.
-yolo_run: true
+yolo_run: false
